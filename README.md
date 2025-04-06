@@ -9,31 +9,58 @@ Rip all your favorite audiobooks from libby!
 
 <sup>Be careful, I have had multiple library cards banned in the past from using this tool (See [#14](https://github.com/PsychedelicPalimpsest/LibbyRip/issues/14), [#12](https://github.com/PsychedelicPalimpsest/LibbyRip/issues/12), and [#8](https://github.com/PsychedelicPalimpsest/LibbyRip/issues/8) for more details) </sup>
 
-## How to use
+## Using the Python Script (`bakeMetadata.py`)
 
-1. Install the [TamperMonkey](https://www.tampermonkey.net/) extension for your browser.
-2. Install the userscript from the [GreasyFork page](https://greasyfork.org/en/scripts/498782-libregrab)
-3. Find your audiobook on Libby and export.
+This repository includes a Python script that allows you to bake metadata into your downloaded audiobook MP3s, either via the command-line or a GUI.
 
-**NOTE:** If you do not see anything, it _could_ be because TamperMonkey is not set up properly on Chrome (and chromeium based) browsers! See the TamperMonkey [FAQ](https://www.tampermonkey.net/faq.php#Q209) page here for more info.
+### Requirements
 
-<a href='https://ko-fi.com/V7V81BFLAH' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi6.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
- 
-## Using the Python script
+Python 3.x is required, along with the dependencies listed in `requirements.txt`. Install them using:
 
-The Python script provided with this repo provides an optional way to bake metadata in your downloaded media.
-
-To run the script Python is required, and you must install the dependencies using the following command:
-```bash
+```
 pip install -r requirements.txt
 ```
-Then simply run the script, and drag-and-drop the extracted folder with your audiobook in it. (You must extract the zip file, then use the folder with mp3s in it)
-If you wish to use the script to make metadata, you must `Export audiobook` to include the metadata in the zip file.
 
-<sup>Note If you are getting a `Lame tag CRC check failed` mesage, that is **not** an error, just a warning, and it means nothing for you. It will still bake the metadata, just means _something_, is wrong with the mp3 Libby gave. (Not actually sure what the issue is myself)</sup>
+### Running the Script
+
+You can run the script in either **CLI mode** or **GUI mode**, depending on your needs:
+
+#### Command-Line Mode
+
+```
+python bakeMetadata.py [<audiobook_directory>]
+```
+
+- If no directory is passed as an argument, you will be prompted to enter one.
+- This mode is ideal for batch automation or terminal workflows.
+- Output, progress, and errors will appear in the console.
+
+#### GUI Mode
+
+```
+python bakeMetadata.py --gui [<audiobook_directory>]
+```
+
+- Launches a PyQt5 graphical interface.
+- If no directory is passed, you'll be prompted to select one with a file dialog.
+- All output and errors (including warnings like `Lame tag CRC check failed`) will be shown in a scrollable status window within the GUI instead of the terminal.
+- Useful for users who prefer a more visual interface.
+
+### What It Does
+
+This script does the following:
+- Loads the metadata exported with your audiobook from Libby (`metadata.json`).
+- Embeds chapter information and cover art into each `Part *.mp3` file using the `eyed3` library.
+- Sets ID3 tags including title, artist, album, and track number.
+
+### Notes
+
+- The audiobook directory **must** contain a `metadata` subdirectory with `metadata.json` and a cover image.
+- The script assumes filenames follow the `Part X.mp3` naming convention.
+- The message `Lame tag CRC check failed` is a **harmless warning** and can be safely ignored. It is now shown in the status window when using the GUI.
 
 ## Note on EPUBs
-The EPUB downloader is **unstable**, and **unreliable**. It works with a majority of books, however Libby does some processing to the xhtml before it is sent to the client, so that needs repaired, and this is not perfect, in addition I have no experience with the EPUB format. I am always open to contributions, so if you find an issue and want to fix it, please do. 
+The EPUB downloader is **unstable**, and **unreliable**. It works with a majority of books, however Libby does some processing to the xhtml before it is sent to the client, so that needs repaired, and this is not perfect, in addition I have no experience with the EPUB format. I am always open to contributions, so if you find an issue and want to fix it, please do.
 
 
 <hr>

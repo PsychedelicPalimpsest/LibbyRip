@@ -1,1 +1,2 @@
 eyeD3
+PyQt5
