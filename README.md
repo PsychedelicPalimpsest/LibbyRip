@@ -9,25 +9,37 @@ Rip all your favorite audiobooks from libby!
 
 <sup>Be careful, I have had multiple library cards banned in the past from using this tool (See [#14](https://github.com/PsychedelicPalimpsest/LibbyRip/issues/14), [#12](https://github.com/PsychedelicPalimpsest/LibbyRip/issues/12), and [#8](https://github.com/PsychedelicPalimpsest/LibbyRip/issues/8) for more details) </sup>
 
+
+## How to use
+
+1. Install the [TamperMonkey](https://www.tampermonkey.net/) extension for your browser.
+2. Install the userscript from the [GreasyFork page](https://greasyfork.org/en/scripts/498782-libregrab)
+3. Find your audiobook on Libby and export.
+
+**NOTE:** If you do not see anything, it _could_ be because TamperMonkey is not set up properly on Chrome (and chromeium based) browsers! See the TamperMonkey [FAQ](https://www.tampermonkey.net/faq.php#Q209) page here for more info.
+
+<a href='https://ko-fi.com/V7V81BFLAH' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi6.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+
+
 ## Using the Python Script (`bakeMetadata.py`)
 
 This repository includes a Python script that allows you to bake metadata into your downloaded audiobook MP3s, either via the command-line or a GUI.
 
-### Requirements
+### Script Requirements
 
 Python 3.x is required, along with the dependencies listed in `requirements.txt`. Install them using:
 
-```
+```bash
 pip install -r requirements.txt
 ```
 
-### Running the Script
+### Running The Script
 
 You can run the script in either **CLI mode** or **GUI mode**, depending on your needs:
 
 #### Command-Line Mode
 
-```
+```bash
 python bakeMetadata.py [<audiobook_directory>]
 ```
 
@@ -37,7 +49,7 @@ python bakeMetadata.py [<audiobook_directory>]
 
 #### GUI Mode
 
-```
+```bash
 python bakeMetadata.py --gui [<audiobook_directory>]
 ```
 
@@ -46,7 +58,7 @@ python bakeMetadata.py --gui [<audiobook_directory>]
 - All output and errors (including warnings like `Lame tag CRC check failed`) will be shown in a scrollable status window within the GUI instead of the terminal.
 - Useful for users who prefer a more visual interface.
 
-### What It Does
+### What The Script Does
 
 This script does the following:
 - Loads the metadata exported with your audiobook from Libby (`metadata.json`).
