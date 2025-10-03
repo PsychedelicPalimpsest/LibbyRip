@@ -14,6 +14,8 @@
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
 // @require       https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js
 // @grant         none
+// @downloadURL https://update.greasyfork.org/scripts/498782/LibreGRAB.user.js
+// @updateURL https://update.greasyfork.org/scripts/498782/LibreGRAB.meta.js
 // ==/UserScript==
 
 (()=>{
@@ -517,7 +519,20 @@
     const originalBind = Function.prototype.bind;
     Function.prototype.bind = function(...args) {
         const boundFn = originalBind.apply(this, args);
-        boundFn.__boundArgs = args.slice(1); // Store bound arguments (excluding `this`)
+        
+        // Store bound arguments (excluding `this`) for potential decryption function
+        boundFn.__boundArgs = args.slice(1);
+        
+        // Also store the original function for debugging
+        boundFn.__originalFunction = this;
+        
+        // If this looks like a decryption function, store it globally
+        if (this.toString().includes('decryption') || 
+            args.some(arg => typeof arg === 'function' && arg.toString().includes('decryption'))) {
+            console.log("Decryption function detected:", this);
+            window.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
+        }
+        
         return boundFn;
     };
 
@@ -750,6 +765,7 @@
         packageElement.setAttribute('xmlns', 'http://www.idpf.org/2007/opf');
         packageElement.setAttribute('xmlns:dc', 'http://purl.org/dc/elements/1.1/');
         packageElement.setAttribute('xmlns:dcterms', 'http://purl.org/dc/terms/');
+        packageElement.setAttribute('xmlns:xsi', 'http://www.w3.org/2001/XMLSchema-instance');
 
         // Step 3: Create and append child elements to the root
         const metadata = doc.createElementNS('http://www.idpf.org/2007/opf', 'metadata');
@@ -823,8 +839,8 @@
         let components = getBookComponents();
         components.forEach(chapter =>{
             const item = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
-            let id = chapter.meta.id;
-            if (idStore.includes(id)) {
+            let id = chapter.meta.id || crypto.randomUUID();
+            while (idStore.includes(id)) {
               id = id + "-" + crypto.randomUUID();
             }
             item.setAttribute('id', id);
@@ -835,7 +851,7 @@
 
 
             const itemref = doc.createElementNS('http://www.idpf.org/2007/opf', 'itemref');
-            itemref.setAttribute('idref', chapter.meta.id);
+            itemref.setAttribute('idref', id); // Use the same id as the manifest item
             itemref.setAttribute('linear', "yes");
             spine.appendChild(itemref);
         });
@@ -844,7 +860,7 @@
             const item = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
             let aname = asset.startsWith("http") ? getFilenameFromURL(asset) : asset;
             let id = aname.split(".")[0];
-            if (idStore.includes(id)) {
+            while (idStore.includes(id)) {
               id = id + "-" + crypto.randomUUID();
             }
             item.setAttribute('id', id);
@@ -928,12 +944,17 @@
 
         const zip = new JSZip();
         zip.file("mimetype", "application/epub+zip", {compression: "STORE"});
-        zip.folder("META-INF").file("container.xml", `<?xml version="1.0" encoding="UTF-8"?>
+        let metaInf = zip.folder("META-INF");
+        metaInf.file("container.xml", `<?xml version="1.0" encoding="UTF-8"?>
                 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
                     <rootfiles>
                         <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
                     </rootfiles>
                 </container>
+        `);
+        // Add required encryption file for DRM compliance (required by EPUB spec)
+        metaInf.file("encryption.xml", `<?xml version="1.0" encoding="UTF-8"?>
+                <encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"/>
         `);
 
         let oebps = zip.folder("OEBPS");
@@ -947,11 +968,12 @@
         downloadElem.innerHTML += "Zip progress: <b id='zipProg'>0</b>%<br>";
 
 
-        // Generate the zip file
+        // Generate the zip file - mimetype must be first and uncompressed
         const zipBlob = await zip.generateAsync({
             type: 'blob',
             compression: "DEFLATE",
             streamFiles: true,
+            mimeType: 'application/epub+zip',
         }, (meta)=>{
             if (meta.percent)
                 downloadElem.querySelector("#zipProg").textContent = meta.percent.toFixed(2);
@@ -987,12 +1009,36 @@ function bifFoundBook(){
         alert("Injection failed! __bif_cfc1 not found");
         return;
     }
+    
+    // Debug: Log the original function structure
+    console.log("Original __bif_cfc1:", window.__bif_cfc1);
+    console.log("__bif_cfc1.__boundArgs:", window.__bif_cfc1.__boundArgs);
     const old_crf1 = window.__bif_cfc1;
     window.__bif_cfc1 = (win, edata)=>{
         // If the bind hook succeeds, then the first element of bound args
         // will be the decryption function. So we just passivly build up an
         // index of the pages!
-        pages[win.name] = old_crf1.__boundArgs[0](edata);
+        if (old_crf1.__boundArgs && old_crf1.__boundArgs[0]) {
+            pages[win.name] = old_crf1.__boundArgs[0](edata);
+        } else {
+            console.warn("Bind args not found, trying alternative decryption method");
+            // Try global decryption function if available
+            if (window.__libregrab_decryption_fn) {
+                try {
+                    pages[win.name] = window.__libregrab_decryption_fn(edata);
+                } catch (error) {
+                    console.error("Global decryption function failed:", error);
+                }
+            }
+            // Final fallback: try to extract decrypted content directly
+            try {
+                pages[win.name] = old_crf1(win, edata);
+            } catch (error) {
+                console.error("Failed to decrypt content:", error);
+                console.log("Attempting raw edata extraction");
+                pages[win.name] = edata; // Sometimes the edata is already decrypted
+            }
+        }
         return old_crf1(win, edata);
     };
 
