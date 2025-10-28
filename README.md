@@ -71,6 +71,26 @@ This script does the following:
 - The script assumes filenames follow the `Part X.mp3` naming convention.
 - The message `Lame tag CRC check failed` is a **harmless warning** and can be safely ignored. It is now shown in the status window when using the GUI.
 
+### Other Tools
+
+A couple of utility scripts are included as well:
+
+#### `buildChapters.py`
+
+`buildChapters.py` can be used to help add chapter metadata to a *compiled* m4b file.
+
+When concatenating all of the smaller `Part XXX.mp3` files together, chapter metadata is often lost or becomes less reliable.  This script writes chapter metadata to a file which can then be embeded using other tools.
+
+**Usage**:
+
+```bash
+# Produce a chapters.txt file for use with m4b-tool and tone
+python buildChapters.py --chapters < /path/to/audiobook/metadata/metadata.json > chapters.txt
+
+# Produce an ffmetadata metadata.txt file for use with ffmpeg
+python buildChapters.py --ffmpeg < /path/to/audiobook/metadata/metadata.json > metadata.txt
+```
+
 ## Note on EPUBs
 The EPUB downloader is **unstable**, and **unreliable**. It works with a majority of books, however Libby does some processing to the xhtml before it is sent to the client, so that needs repaired, and this is not perfect, in addition I have no experience with the EPUB format. I am always open to contributions, so if you find an issue and want to fix it, please do.
 
