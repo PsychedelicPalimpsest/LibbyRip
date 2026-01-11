@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2025-12-17
+// @version       2026-01-09
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -425,6 +425,28 @@
 
 
 
+    // Helper function for fallback blob download (older browsers)
+    async function fallbackBlobDownload(files, filename) {
+        downloadElem.innerHTML += "Using fallback download method...<br>";
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+
+        const zipBlob = await downloadZip(files).blob();
+
+        downloadElem.innerHTML += "Generated zip file! <br>";
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+
+        const downloadUrl = URL.createObjectURL(zipBlob);
+
+        const link = document.createElement('a');
+        link.href = downloadUrl;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+
+        setTimeout(() => URL.revokeObjectURL(downloadUrl), 100);
+    }
+
     async function createAndDownloadZip(urls, addMeta) {
         const files = [];
 
@@ -446,50 +468,64 @@
                 input: blob
             };
         });
-        
+
         // Start metadata creation in parallel with file downloads
         const metadataPromise = addMeta ? createMetadata() : Promise.resolve([]);
-        
+
         // Wait for both file downloads and metadata creation to complete
         const [downloadedFiles, metadataFiles] = await Promise.all([
             Promise.all(fetchPromises),
             metadataPromise
         ]);
-        
+
         files.push(...downloadedFiles);
         files.push(...metadataFiles);
 
-        downloadElem.innerHTML += "<br><b>Downloads complete!</b> Now waiting for them to be assembled! (This might take a <b><i>minute</i></b>) <br>";
-        downloadElem.innerHTML += "Generating zip file...";
-
+        downloadElem.innerHTML += "<br><b>Downloads complete!</b> Starting ZIP generation and download...<br>";
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        // Generate the zip file
-        const zipBlob = await downloadZip(files).blob();
+        const filename = getAuthorString() + ' - ' + BIF.map.title.main + '.zip';
 
-        downloadElem.innerHTML += "Generated zip file! <br>"
-        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        // Try using File System Access API for streaming (much faster)
+        if ('showSaveFilePicker' in window) {
+            try {
+                const handle = await window.showSaveFilePicker({
+                    suggestedName: filename,
+                    types: [{
+                        description: 'ZIP Archive',
+                        accept: {'application/zip': ['.zip']},
+                    }],
+                });
 
-        // Create a download link for the zip file
-        const downloadUrl = URL.createObjectURL(zipBlob);
+                downloadElem.innerHTML += "Streaming ZIP file to disk...<br>";
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        downloadElem.innerHTML += "Generated zip file link! <br>"
-        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                const writable = await handle.createWritable();
+                const zipStream = downloadZip(files).body;
 
-        const link = document.createElement('a');
-        link.href = downloadUrl;
+                await zipStream.pipeTo(writable);
 
-        link.download = getAuthorString() + ' - ' + BIF.map.title.main + '.zip';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
+                downloadElem.innerHTML += "Download complete!<br>";
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    // User cancelled the save dialog
+                    downloadElem.innerHTML += "Download cancelled by user.<br>";
+                } else {
+                    console.error('Streaming download failed:', err);
+                    downloadElem.innerHTML += "Streaming failed, using fallback...<br>";
+                    // Fall back to blob method
+                    await fallbackBlobDownload(files, filename);
+                }
+            }
+        } else {
+            // Fall back to blob method for older browsers
+            await fallbackBlobDownload(files, filename);
+        }
 
         downloadState = -1;
         downloadElem.innerHTML = ""
         downloadElem.classList.remove("active");
-
-        // Clean up the object URL
-        setTimeout(() => URL.revokeObjectURL(downloadUrl), 100);
     }
 
     function exportChapters(){
@@ -1009,27 +1045,47 @@
         makeToc(files);
 
 
-        downloadElem.innerHTML += "<br><b>Downloads complete!</b> Now waiting for them to be assembled! (This might take a <b><i>minute</i></b>) <br>";
-        downloadElem.innerHTML += "Generating EPUB file...<br>";
-
-
-        // Generate the zip file
-        const zipBlob = await downloadZip(files).blob();
-
-
-        downloadElem.innerHTML += `EPUB generation complete! Starting download<br>`
+        downloadElem.innerHTML += "<br><b>Downloads complete!</b> Starting EPUB generation and download...<br>";
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        const downloadUrl = URL.createObjectURL(zipBlob);
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.download = BIF.map.title.main + '.epub';
-        link.click();
+        const filename = BIF.map.title.main + '.epub';
 
+        // Try using File System Access API for streaming (much faster)
+        if ('showSaveFilePicker' in window) {
+            try {
+                const handle = await window.showSaveFilePicker({
+                    suggestedName: filename,
+                    types: [{
+                        description: 'EPUB eBook',
+                        accept: {'application/epub+zip': ['.epub']},
+                    }],
+                });
 
+                downloadElem.innerHTML += "Streaming EPUB file to disk...<br>";
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        // Clean up the object URL
-        setTimeout(() => URL.revokeObjectURL(downloadUrl), 100);
+                const writable = await handle.createWritable();
+                const zipStream = downloadZip(files).body;
+
+                await zipStream.pipeTo(writable);
+
+                downloadElem.innerHTML += "Download complete!<br>";
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    // User cancelled the save dialog
+                    downloadElem.innerHTML += "Download cancelled by user.<br>";
+                } else {
+                    console.error('Streaming download failed:', err);
+                    downloadElem.innerHTML += "Streaming failed, using fallback...<br>";
+                    // Fall back to blob method
+                    await fallbackBlobDownload(files, filename);
+                }
+            }
+        } else {
+            // Fall back to blob method for older browsers
+            await fallbackBlobDownload(files, filename);
+        }
 
         downloadState = -1;
     }
