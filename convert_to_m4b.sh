@@ -164,11 +164,27 @@ if ! ls "$WORK_DIR"/Part*.mp3 &> /dev/null; then
     error "No Part*.mp3 files found in: $WORK_DIR"
 fi
 
+# Create temporary concat file
+CONCAT_FILE=$(mktemp)
+trap "rm -f '$CONCAT_FILE'; cleanup" EXIT
+
+# Build the concat file with proper escaping
+find "$WORK_DIR" -maxdepth 1 -name "Part*.mp3" -type f | sort -V | while IFS= read -r file; do
+    # Escape special characters for ffmpeg concat demuxer
+    # In single quotes, we need to handle single quotes specially: '\''
+    # (end quote, escaped quote, start quote)
+    escaped_file="${file//\'/\'\\\'\'}"
+    printf "file '%s'\n" "$escaped_file"
+done > "$CONCAT_FILE"
+
 # Create the m4b file
-if ffmpeg -f concat -safe 0 -i <(find "$WORK_DIR" -maxdepth 1 -name "Part*.mp3" -type f | sort -V | while IFS= read -r file; do printf "file '%s'\n" "$file"; done) -i "$METADATA_TXT" -c:a aac -b:a "$HIGHEST_BITRATE" -map_metadata 1 -map_chapters 1 -f ipod "$OUTPUT_FILE" -y 2>&1 | grep -v "^frame="; then
+if ffmpeg -f concat -safe 0 -i "$CONCAT_FILE" -i "$METADATA_TXT" -c:a aac -b:a "$HIGHEST_BITRATE" -map_metadata 1 -map_chapters 1 -f ipod "$OUTPUT_FILE" -y 2>&1 | grep -v "^frame="; then
     success "Successfully created: $OUTPUT_FILE"
 else
     error "Failed to create m4b file"
 fi
+
+# Clean up concat file
+rm -f "$CONCAT_FILE"
 
 info "Conversion complete!"
