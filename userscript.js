@@ -149,6 +149,13 @@
         var pad = new Array(1 + padlen).join(pad_char);
         return (pad + num).slice(-pad.length);
     }
+    function safeFilename(name) {
+        return name
+            .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 200);
+    }
     let firstChapClick = true;
     function viewChapters(){
         // Populate chapters ONLY after first viewing
@@ -305,9 +312,9 @@
     let downloadState = -1;
     let ffmpeg = null;
     async function createAndDownloadMp3(urls){
-		await initFFmpeg();
         let metadata = getMetadata();
         downloadElem.innerHTML += "Downloading mp3 files <br>";
+        await initFFmpeg();
         await ffmpeg.writeFile("chapters.txt", generateTOCFFmpeg(metadata));
 
 
@@ -486,14 +493,25 @@
 
         // Start metadata creation in parallel with file downloads
         const metadataPromise = addMeta ? createMetadata() : Promise.resolve([]);
+        let metadata = getMetadata();
 
         // Wait for both file downloads and metadata creation to complete
         const [downloadedFiles, metadataFiles] = await Promise.all([
             Promise.all(fetchPromises),
             metadataPromise
         ]);
+        
+        // Add files to ffmpeg so we can split them into chapters
+        await initFFmpeg();
+        for (const file of downloadedFiles) {
+            const blobUrl = URL.createObjectURL(file.input);
+            await ffmpeg.writeFileFromUrl(file.name, blobUrl);
+            URL.revokeObjectURL(blobUrl);
+        }
+        
+        const chapterFiles = await splitPartsIntoChapters(downloadedFiles, metadata)
 
-        files.push(...downloadedFiles);
+        files.push(...chapterFiles);
         files.push(...metadataFiles);
 
         downloadElem.innerHTML += "<br><b>Downloads complete!</b> Starting ZIP generation and download...<br>";
@@ -542,6 +560,192 @@
         downloadElem.innerHTML = ""
         downloadElem.classList.remove("active");
     }
+    
+    async function splitPartsIntoChapters(partFiles, metadata) {
+        const chapterFiles = [];
+        downloadElem.innerHTML += "Splitting Parts into Chapters...<br>";
+        const spineToFile = partFiles.map(f => f.name);
+        if (!metadata.chapters?.length) return [];
+        const chapters = metadata.chapters;
+        let lastTitle = null;
+        for (let i = 0; i < chapters.length; i++) {
+            const curr = chapters[i];
+            const next = chapters[i + 1];
+            const outName = `${safeFilename(curr.title)}.mp3`;
+            
+            // protect against duplicate titles
+            if (curr.title === lastTitle) continue;
+            lastTitle = curr.title;
+
+            downloadElem.innerHTML += "Splitting Chapter " + outName + "<br>";
+            downloadElem.scrollTop = downloadElem.scrollHeight;
+            
+            // last chapter special case
+            if (!next) {
+                await ffmpeg.exec([
+                    "-y",
+                    "-ss", `${curr.offset}`,
+                    "-i", spineToFile[curr.spine],
+                    "-map", "0:a",
+                    "-c", "copy",
+                    "-metadata", `title=${curr.title}`,
+                    "-metadata", `album=${metadata.title}`,
+                    "-metadata", `artist=${getAuthorString()}`,
+                    "-metadata", `track=${i + 1}`,
+                    "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
+                    outName
+                ]);
+                const data = await ffmpeg.readFile(outName);
+                chapterFiles.push({
+                    name: outName,
+                    input: new Blob([data.buffer], { type: "audio/mpeg" })
+                });
+                console.dir(ffmpeg);
+                // "delete", as ffmpeg.deleteFile is not available
+                await ffmpeg.writeFile(outName, new Uint8Array());
+                continue;
+            }
+
+            // -------------------------
+            // CASE 1: same spine
+            // -------------------------
+            if (curr.spine === next.spine) {
+                const duration = next.offset - curr.offset;
+                await ffmpeg.exec([
+                    "-y",
+                    "-ss", `${curr.offset}`,
+                    "-i", spineToFile[curr.spine],
+                    "-t", `${duration}`,
+                    "-map", "0:a",
+                    "-c", "copy",
+                    "-metadata", `title=${curr.title}`,
+                    "-metadata", `album=${metadata.title}`,
+                    "-metadata", `artist=${getAuthorString()}`,
+                    "-metadata", `track=${i + 1}`,
+                    "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
+                    outName
+                ]);
+                const blobUrl = await ffmpeg.readFileToUrl(outName);
+                chapterFiles.push({
+                    name: outName,
+                    input: await (await fetch(blobUrl)).blob()
+                });
+                URL.revokeObjectURL(blobUrl);
+                continue;
+            }
+
+            // -------------------------
+            // CASE 2: exact boundary
+            // -------------------------
+            if (next.spine === curr.spine + 1 && next.offset === 0) {
+                await ffmpeg.exec([
+                    "-y",
+                    "-ss", `${curr.offset}`,
+                    "-i", spineToFile[curr.spine],
+                    "-map", "0:a",
+                    "-c", "copy",
+                    "-metadata", `title=${curr.title}`,
+                    "-metadata", `album=${metadata.title}`,
+                    "-metadata", `artist=${getAuthorString()}`,
+                    "-metadata", `track=${i + 1}`,
+                    "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
+                    outName
+                ]);
+                const blobUrl = await ffmpeg.readFileToUrl(outName);
+                chapterFiles.push({
+                    name: outName,
+                    input: await (await fetch(blobUrl)).blob()
+                });
+                URL.revokeObjectURL(blobUrl);
+                continue;
+            }
+
+            // -------------------------
+            // CASE 3: spans multiple parts
+            // -------------------------
+            const tempFiles = [];
+
+            // tail of first
+            const tmpA = `tmp_a.mp3`;
+            await ffmpeg.exec([
+                "-y",
+                "-ss", `${curr.offset}`,
+                "-i", spineToFile[curr.spine],
+                "-map", "0:a",
+                "-c", "copy",
+                "-metadata", `title=${curr.title}`,
+                "-metadata", `album=${metadata.title}`,
+                "-metadata", `artist=${getAuthorString()}`,
+                "-metadata", `track=${i + 1}`,
+                "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
+                tmpA
+            ]);
+            tempFiles.push(tmpA);
+
+            // middle full parts
+            for (let s = curr.spine + 1; s < next.spine; s++) {
+                tempFiles.push(spineToFile[s]);
+            }
+
+            // head of last
+            const tmpB = `tmp_b.mp3`;
+            if (next.offset > 0) {
+                await ffmpeg.exec([
+                    "-y",
+                    "-ss", "0",
+                    "-i", spineToFile[next.spine],
+                    "-t", `${next.offset}`,
+                    "-map", "0:a",
+                    "-c", "copy",
+                    "-metadata", `title=${curr.title}`,
+                    "-metadata", `album=${metadata.title}`,
+                    "-metadata", `artist=${getAuthorString()}`,
+                    "-metadata", `track=${i + 1}`,
+                    "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
+                    tmpB
+                ]);
+                tempFiles.push(tmpB);
+            } else {
+                console.log("Skipping tmp_b (offset = 0)");
+            }
+
+            // concat
+            const listFile = `list.txt`;
+            await ffmpeg.writeFile(
+                listFile,
+                tempFiles.map(f => `file '${f}'`).join("\n") + "\n"
+            );
+
+            await ffmpeg.exec([
+                "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", listFile,
+                "-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
+                "-map", "0:a",
+                "-c", "copy",
+                "-metadata", `title=${curr.title}`,
+                "-metadata", `album=${metadata.title}`,
+                "-metadata", `artist=${getAuthorString()}`,
+                "-metadata", `track=${i + 1}`,
+                "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
+                outName
+            ]);
+            const blobUrl = await ffmpeg.readFileToUrl(outName);
+            chapterFiles.push({
+                name: outName,
+                input: await (await fetch(blobUrl)).blob()
+            });
+            URL.revokeObjectURL(blobUrl);
+
+            // cleanup
+            await ffmpeg.writeFile(tmpA, new Uint8Array());
+            await ffmpeg.writeFile(tmpB, new Uint8Array());
+            await ffmpeg.writeFile(listFile, new Uint8Array());
+        }
+        return chapterFiles;
+    }
 
     function exportChapters(){
         if (downloadState != -1)
@@ -549,7 +753,7 @@
 
         downloadState = 0;
         downloadElem.classList.add("active");
-        downloadElem.innerHTML = "<b>Starting export</b><br>";
+        downloadElem.innerHTML = "<b>Starting chapter export</b><br>";
         createAndDownloadZip(getUrls(), true).then((p)=>{});
     }
 
