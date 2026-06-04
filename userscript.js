@@ -35,19 +35,45 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     // Since the ffmpeg.js file is 50mb, it slows the page down too much
     // to be in a "require" attribute, so we load it in async
     function addFFmpegJs(){
-        let scriptTag = document.createElement("script");
-        scriptTag.setAttribute("type", "text/javascript");
-        scriptTag.setAttribute("src", "https://github.com/PsychedelicPalimpsest/FFmpeg-js/releases/download/14/0.12.5.bundle.js");
-        document.body.appendChild(scriptTag);
+        return new Promise(async (accept, reject) => {
+            try {
+                const response = await fetch(
+                    "https://github.com/PsychedelicPalimpsest/FFmpeg-js/releases/download/14/0.12.5.bundle.js"
+                );
 
-        return new Promise(accept =>{
-            let i = setInterval(()=>{
-                if (window.createFFmpeg){
-                    clearInterval(i);
-                    accept(window.createFFmpeg);
+                if (!response.ok) {
+                    throw new Error(`Failed to download ffmpeg.js: ${response.status} ${response.statusText}`);
                 }
-            }, 50)
-            });
+
+                const blob = await response.blob();
+                const blobUrl = URL.createObjectURL(blob);
+
+                let scriptTag = document.createElement("script");
+                scriptTag.setAttribute("type", "text/javascript");
+                scriptTag.src = blobUrl;
+
+                scriptTag.onload = () => {
+                    let i = setInterval(() => {
+                        if (window.createFFmpeg) {
+                            clearInterval(i);
+                            URL.revokeObjectURL(blobUrl);
+                            accept(window.createFFmpeg);
+                        }
+                    }, 50);
+                };
+
+                scriptTag.onerror = (e) => {
+                    URL.revokeObjectURL(blobUrl);
+                    console.error("[LibreGRAB] Failed to load ffmpeg.js:", e);
+                    reject(e);
+                };
+
+                document.body.appendChild(scriptTag);
+            } catch(e) {
+                console.error("[LibreGRAB] ffmpeg.js download failed:", e);
+                reject(e);
+            }
+        });
     }
 
     let downloadElem;
@@ -349,7 +375,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
         await Promise.all(fetchPromises);
 
-        downloadElem.innerHTML += `<br><b>Downloads complete!</b> Now combining them together! (This might take a <b><i>minute</i></b>) <br> Transcode progress: <span id="mp3Progress">0</span> hours in to audiobook<br>`
+        downloadElem.innerHTML += `<br><b>Downloads complete!</b> Now combining them together! (This might take a <b><i>minute</i></b>) <br>Transcode progress: <span id="mp3Progress">0</span> hours in to audiobook<br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
         let files = "";
@@ -407,6 +433,31 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
     }
 
+	let ffmpegInitPromise = null;
+
+	async function initFFmpeg() {
+		console.log("[LibreGRAB] initFFmpeg");
+		if (ffmpegInitPromise) return ffmpegInitPromise;
+		ffmpegInitPromise = (async () => {
+			if (!window.createFFmpeg) {
+				downloadElem.innerHTML += "Downloading FFmpeg.wasm (~50MB)<br>";
+				console.log("[LibreGRAB] Downloading FFmpeg.wasm (~50MB)");
+				await addFFmpegJs();
+				downloadElem.innerHTML += "Completed FFmpeg.wasm download<br>";
+				console.log("[LibreGRAB] Completed FFmpeg.wasm download");
+			}
+
+			// Initialize FFmpeg if not already done
+			if (!ffmpeg) {
+				downloadElem.innerHTML += "Initializing FFmpeg.wasm<br>";
+				console.log("[LibreGRAB] Initializing FFmpeg.wasm");
+				ffmpeg = await window.createFFmpeg({ log: true });
+				downloadElem.innerHTML += "FFmpeg.wasm initialized<br>";
+				console.log("[LibreGRAB] FFmpeg.wasm initialized");
+			}
+		})();
+		return ffmpegInitPromise;
+	}
     let ffmpegInitPromise = null;
 
     async function initFFmpeg() {
@@ -661,7 +712,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let gc = 0;
         await waitForChapters(()=>{
             gc+=1;
-            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=window.pages[page.id]).length}/${totComp}`;
+            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=window.pages[c.id]).length}/${totComp}`;
         });
 
         downloadElem.innerHTML += `Chapter gathering complete<br>`
@@ -746,7 +797,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             }
 
             // Replace old element with the new one
-            el.parentNode.replaceChild(newElement, el);
+            el.parentNode.replaceChild(newElement, newElement);
         }
 
         for (let el of elements) {
@@ -823,7 +874,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             bmp: 'image/bmp',
             webp: 'image/webp',
             mp4: 'video/mp4',
-            mp3: 'audio/mp3',
+            mp3: 'audio/mpeg',
             pdf: 'application/pdf',
             txt: 'text/plain',
             html: 'text/html',
@@ -1118,6 +1169,25 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         s.innerHTML = CSS;
         document.head.appendChild(s)
 
+    if (!window.__bif_cfc1){
+        alert("Injection failed! __bif_cfc1 not found");
+        return;
+    }
+
+    // Debug: Log the original function structure
+    console.log("Original __bif_cfc1:", window.__bif_cfc1);
+    console.log("__bif_cfc1.__boundArgs:", window.__bif_cfc1.__boundArgs);
+    const old_crf1 = window.__bif_cfc1;
+    window.__bif_cfc1 = (win, edata)=>{
+        // If the bind hook succeeds, then the first element of bound args
+        // will be the decryption function. So we just passivly build up an
+        // index of the pages!
+        if (old_crf1.__boundArgs && old_crf1.__boundArgs[0]) {
+            pages[win.name] = old_crf1.__boundArgs[0](edata);
+        } else {
+            console.warn("Bind args not found, trying alternative decryption method");
+            // Try global decryption function if available
+            if (window.__libregrab_decryption_fn) {
         if (!window.__bif_cfc1){
             alert("Injection failed! __bif_cfc1 not found");
             return;
@@ -1190,11 +1260,49 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
        =========================================
     */
 
-    /* =========================================
+     /* =========================================
               BEGIN INITIALIZER SECTION!
        =========================================
     */
 
+// The "BIF" contains all the info we need to download
+// stuff, so we wait until the page is loaded, and the
+// BIF is present, to inject the pirate menu.
+(function init() {
+    const checkReady = () => {
+        return window.BIF != undefined && document.querySelector(".nav-progress-bar") != undefined;
+    };
+
+    if (checkReady()) {
+        startScript();
+        return;
+    }
+
+    let attempts = 0;
+    const maxAttempts = 200; // 60 seconds at 300ms intervals
+    const interval = setInterval(() => {
+        attempts++;
+
+        if (checkReady()) {
+            clearInterval(interval);
+            console.log("[LibreGRAB] Page ready after " + attempts + " attempts");
+            startScript();
+        } else if (attempts >= maxAttempts) {
+            clearInterval(interval);
+            console.error("[LibreGRAB] Timeout: Page not ready after " + maxAttempts + " attempts");
+        }
+    }, 300);
+
+    function startScript() {
+        let mode = location.hostname.split(".")[1]; // "listen" or "read"
+        console.log("[LibreGRAB] Detected mode: " + mode + " from hostname: " + location.hostname);
+
+        if (mode == "listen") {
+            bifFoundAudiobook();
+        } else if (mode == "read") {
+            bifFoundBook();
+        } else {
+            console.error("[LibreGRAB] Unknown mode: " + mode);
     // The "BIF" contains all the info we need to download
     // stuff, so we wait until the page is loaded, and the
     // BIF is present, to inject the pirate menu.
@@ -1218,6 +1326,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         (document.documentElement || document.head || document.body).appendChild(script);
         script.remove();
     }
+})();
 
     injectPageScript(`${clientZipReadyCode}(${mainCode.toString()})();`);
 
