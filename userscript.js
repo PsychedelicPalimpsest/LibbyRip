@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-06-01
+// @version       2026-06-12
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -112,6 +112,80 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     }
 
 
+    /* -----------------------------------------------------------------
+       Thunder metadata piggyback
+
+       BIF.map (the openbook record) gives us title, creators (with
+       roles), description, language and chapters -- but NOT publisher,
+       publish date, genres or ISBN. Those live in Libby's catalog
+       record, served from thunder.api.overdrive.com, which the reader
+       UI requests on its own.
+
+       Rather than issue our own cross-origin request (Thunder's CORS
+       policy may reject a userscript-initiated call), we piggyback on
+       the request Libby already makes and capture the response as it
+       goes by. The raw body is stashed and matched to this book's CRID
+       later, at export time, when BIF is guaranteed to be populated.
+
+       Observed transport is XMLHttpRequest (not fetch), so we hook XHR.
+       ----------------------------------------------------------------- */
+    let thunderRaw = null;
+    let resolveThunder;
+    const thunderReady = new Promise(r => { resolveThunder = r; });
+
+    // Stash the request URL in open(), then on load() read and parse the
+    // response body into the shared thunderRaw / thunderReady.
+    const old_xhr_open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest){
+        try { this.__lg_url = url; } catch (e) {}
+        return old_xhr_open.apply(this, [method, url, ...rest]);
+    };
+
+    const old_xhr_send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(...args){
+        try {
+            const url = this.__lg_url || "";
+            if (typeof url === "string" &&
+                url.includes("thunder.api.overdrive.com") && url.includes("media")){
+                this.addEventListener("load", function(){
+                    try {
+                        // responseType 'json' exposes the parsed object on .response;
+                        // otherwise parse the text ourselves.
+                        let data = null;
+                        if (this.responseType === "json"){
+                            data = this.response;
+                        } else {
+                            const txt = this.responseText || this.response;
+                            data = (typeof txt === "string") ? JSON.parse(txt) : txt;
+                        }
+                        if (data){
+                            thunderRaw = data;
+                            resolveThunder(data);
+                        }
+                    } catch (err) {
+                        console.warn("[LibreGRAB] Thunder XHR parse failed:", err);
+                    }
+                });
+            }
+        } catch (e) { /* never let our hook break the page's request */ }
+        return old_xhr_send.apply(this, args);
+    };
+
+    // Thunder may return a single media object or an array / {items:[...]}
+    // of titles (the bulk endpoint). Select the record whose reserveId
+    // matches this book's CRID so a "recommended titles" entry can never
+    // be picked up by mistake.
+    function pickThunderRecord(data){
+        let crid = null;
+        try { crid = (BIF.map["-odread-crid"] || [])[0]; } catch (e) {}
+        const matches = (r) => r && r.reserveId && crid &&
+            String(r.reserveId).toLowerCase() === String(crid).toLowerCase();
+        if (Array.isArray(data)) return data.find(matches) || null;
+        if (data && Array.isArray(data.items)) return data.items.find(matches) || null;
+        if (matches(data)) return data;
+        return null;
+    }
+
 
     const audioBookNav = `
         <a class="pLink" id="chap"> <h1> View chapters </h1> </a>
@@ -219,10 +293,122 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         return BIF.map.creator.filter(creator => creator.role === 'author').map(creator => creator.name).join(", ");
     }
 
+    /* -----------------------------------------------------------------
+       Metadata helpers for the single-file MP3 export.
+       ----------------------------------------------------------------- */
+
+    // Narrator(s): role is lowercase in BIF.map ("narrator"); guard with
+    // toLowerCase() so the same helper survives Thunder's capitalised roles.
+    function getNarratorString(){
+        return BIF.map.creator
+            .filter(c => (c.role || "").toLowerCase() === 'narrator')
+            .map(c => c.name)
+            .join(", ");
+    }
+
+    // Strip HTML tags AND decode entities (&#160;, &rsquo;, ...) in one pass,
+    // then collapse whitespace so the description sits cleanly in an ID3 frame.
+    function stripHtml(html){
+        if (!html) return "";
+        const p = document.createElement("p");
+        p.innerHTML = html;
+        return (p.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    // BIF.map.language is a bare string ("en") for audiobooks, but the
+    // openbook spec also allows an array of {id,name}. Handle both.
+    function getLanguage(){
+        const l = BIF.map.language;
+        if (!l) return "";
+        if (Array.isArray(l)) return (l[0] && (l[0].id || l[0])) || "";
+        return l;
+    }
+
+    // Pull publisher / year / genres / isbn from the piggybacked Thunder
+    // record. Best-effort: any failure returns {} and the export proceeds
+    // with the BIF-only tags.
+    async function getThunderExtras(){
+        try {
+            let raw = thunderRaw;
+            if (!raw){
+                // Give a late-arriving response a brief moment, but never hang.
+                raw = await Promise.race([
+                    thunderReady,
+                    new Promise(r => setTimeout(() => r(null), 1500))
+                ]);
+            }
+            let t = raw ? pickThunderRecord(raw) : null;
+
+            // Fallback: the page never made the call (or we missed it).
+            // This direct request may be blocked by CORS; if so we just bail.
+            if (!t){
+                const crid = (BIF.map["-odread-crid"] || [])[0];
+                if (crid){
+                    try {
+                        const res = await fetch(`https://thunder.api.overdrive.com/v2/media/${crid}`);
+                        if (res.ok) t = pickThunderRecord(await res.json()) || await res.clone?.().json?.();
+                    } catch (e) { /* CORS or network -> give up quietly */ }
+                }
+            }
+            if (!t) return {};
+
+            const ym = String(t.publishDate || t.estimatedReleaseDate || "").match(/^(\d{4})/);
+            const isbn = (() => {
+                const f = (t.formats || []).find(f => Array.isArray(f.identifiers));
+                if (!f) return "";
+                const id = f.identifiers.find(i => i.type === "ISBN");
+                return id ? id.value : "";
+            })();
+
+            return {
+                // imprint is the recognisable label (e.g. "Random House Audio");
+                // publisher is the distributor account. Prefer the imprint.
+                publisher: (t.imprint && t.imprint.name) || (t.publisher && t.publisher.name) || "",
+                year:      ym ? ym[1] : "",
+                genres:    Array.isArray(t.subjects) ? t.subjects.map(s => s.name).filter(Boolean).join("; ") : "",
+                isbn:      isbn
+            };
+        } catch (e) {
+            console.warn("Thunder extras unavailable:", e);
+            return {};
+        }
+    }
+
+    // Build the extra -metadata argv pairs for ffmpeg. Empty values are
+    // skipped so we never write blank tags.
+    async function getExtraMetadataArgs(){
+        const m = BIF.map;
+        const args = [];
+        const push = (k, v) => {
+            if (v != null && String(v).trim() !== "") args.push("-metadata", `${k}=${v}`);
+        };
+
+        // --- From BIF.map (no extra request) ---
+        // Note: `artist` (Author) is already set in the ffmpeg args; we don't
+        // duplicate it as album_artist here.
+        push("composer",     getNarratorString());
+        const desc = stripHtml(m.description && m.description.full);
+        push("description",  desc);
+        push("comment",      desc); // some players surface comment, not description
+        push("language",     getLanguage());
+        push("subtitle",     m.title && m.title.subtitle);
+
+        // --- From Thunder (best effort) ---
+        const extra = await getThunderExtras();
+        push("publisher", extra.publisher);
+        push("date",      extra.year);
+        push("genre",     extra.genres);
+        if (extra.isbn) args.push("-metadata", `isbn=${extra.isbn}`);
+
+        return args;
+    }
+
     function getMetadata(){
         let spineToIndex = BIF.map.spine.map((x)=>x["-odread-original-path"]);
         let metadata = {
             title: BIF.map.title.main,
+            subtitle: (BIF.map.title && BIF.map.title.subtitle) || "",
+            language: getLanguage(),
             description: BIF.map.description,
             coverUrl: BIF.root.querySelector("image").getAttribute("href"),
             creator: BIF.map.creator,
@@ -247,6 +433,17 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
     async function createMetadata(){
         let metadata = getMetadata();
+
+        // Merge the Thunder catalog extras (publisher, year, genres, isbn) into
+        // the JSON so it carries the same enriched metadata we embed in the MP3.
+        // Best-effort: getThunderExtras() returns {} if Thunder is unavailable,
+        // so each field is added only when actually present.
+        const extra = await getThunderExtras();
+        if (extra.publisher) metadata.publisher = extra.publisher;
+        if (extra.year)      metadata.publishYear = extra.year;
+        if (extra.genres)    metadata.genres = extra.genres.split("; ");
+        if (extra.isbn)      metadata.isbn = extra.isbn;
+
         const response = await fetch(metadata.coverUrl);
         const blob = await response.blob();
         const csplit = metadata.coverUrl.split(".");
@@ -365,6 +562,12 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         });
         ffmpeg.setLogger(console.log);
 
+        // Resolve the richer tags (narrator/description/language from BIF,
+        // publisher/year/genre/isbn from the piggybacked Thunder record).
+        // These -metadata flags come AFTER -map_metadata 1, so they override
+        // without disturbing the chapters pulled from chapters.txt.
+        const extraArgs = await getExtraMetadataArgs();
+
         await ffmpeg.exec([
                            "-y", "-f", "concat",
                            "-i", "files.txt",
@@ -377,8 +580,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                             "-metadata", `title=${metadata.title}`,
                             "-metadata", `album=${metadata.title}`,
                             "-metadata", `artist=${getAuthorString()}`,
-                            "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
-                            "-c:a", "copy"])
+                            "-metadata", `encoded_by=LibbyRip/LibreGRAB`])
+                          .concat(extraArgs)
+                          .concat(["-c:a", "copy"])
                           .concat(coverName ? [
                             "-map", "2:v",
                             "-metadata:s:v", "title=Album cover",
