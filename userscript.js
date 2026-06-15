@@ -116,6 +116,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     const audioBookNav = `
         <a class="pLink" id="chap"> <h1> View chapters </h1> </a>
         <a class="pLink" id="down"> <h1> Export as MP3 </h1> </a>
+        <a class="pLink" id="downM4b"> <h1> Export as M4B </h1> </a>
         <a class="pLink" id="exp"> <h1> Export audiobook </h1> </a>
     `;
     const chaptersMenu = `
@@ -130,6 +131,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         nav.innerHTML = audioBookNav;
         nav.querySelector("#chap").onclick = viewChapters;
         nav.querySelector("#down").onclick = exportMP3;
+        nav.querySelector("#downM4b").onclick = exportM4B;
         nav.querySelector("#exp").onclick = exportChapters;
         nav.classList.add("pNav");
         let pbar = document.querySelector(".nav-progress-bar");
@@ -309,7 +311,67 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
     let downloadState = -1;
     let ffmpeg = null;
-    async function createAndDownloadMp3(urls){
+
+    // Per-format config for the single-file audiobook exporters. buildArgs
+    // returns the ffmpeg argument list given the (optional) cover file name,
+    // the metadata object and the output file name.
+    const AUDIO_FORMATS = {
+        mp3: {
+            ext: "mp3",
+            label: "MP3",
+            // The source spine files are already mp3, so we can stream-copy
+            // the audio without re-encoding.
+            buildArgs: (coverName, metadata, outName) =>
+                ["-y", "-f", "concat", "-i", "files.txt", "-i", "chapters.txt"]
+                .concat(coverName ? ["-i", coverName] : [])
+                .concat([
+                    "-map_metadata", "1",
+                    "-codec", "copy",
+                    "-map", "0:a",
+                    "-metadata", `title=${metadata.title}`,
+                    "-metadata", `album=${metadata.title}`,
+                    "-metadata", `artist=${getAuthorString()}`,
+                    "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
+                    "-c:a", "copy"])
+                .concat(coverName ? [
+                    "-map", "2:v",
+                    "-metadata:s:v", "title=Album cover",
+                    "-metadata:s:v", "comment=Cover (front)"]
+                    : [])
+                .concat([outName])
+        },
+        m4b: {
+            ext: "m4b",
+            label: "M4B",
+            // mp3 cannot live in an mp4/m4a container, so the audio is
+            // transcoded to AAC. The "ipod" muxer writes iTunes-style
+            // chapter markers and embedded cover art that audiobook players
+            // (Apple Books, etc.) understand.
+            buildArgs: (coverName, metadata, outName) =>
+                ["-y", "-f", "concat", "-i", "files.txt", "-i", "chapters.txt"]
+                .concat(coverName ? ["-i", coverName] : [])
+                .concat([
+                    "-map_metadata", "1",
+                    "-map_chapters", "1",
+                    "-map", "0:a",
+                    "-metadata", `title=${metadata.title}`,
+                    "-metadata", `album=${metadata.title}`,
+                    "-metadata", `artist=${getAuthorString()}`,
+                    "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
+                    "-c:a", "aac",
+                    "-b:a", "128k"])
+                .concat(coverName ? [
+                    "-map", "2:v",
+                    "-c:v", "copy",
+                    "-disposition:v", "attached_pic",
+                    "-metadata:s:v", "title=Album cover",
+                    "-metadata:s:v", "comment=Cover (front)"]
+                    : [])
+                .concat(["-f", "ipod", outName])
+        }
+    };
+
+    async function createAndDownloadAudio(urls, format){
         await initFFmpeg();
         let metadata = getMetadata();
         downloadElem.innerHTML += "Downloading mp3 files <br>";
@@ -365,35 +427,17 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         });
         ffmpeg.setLogger(console.log);
 
-        await ffmpeg.exec([
-                           "-y", "-f", "concat",
-                           "-i", "files.txt",
-                           "-i", "chapters.txt"]
-                          .concat(coverName ? ["-i", coverName] : [])
-                          .concat([
-                            "-map_metadata", "1",
-                            "-codec", "copy",
-                            "-map", "0:a",
-                            "-metadata", `title=${metadata.title}`,
-                            "-metadata", `album=${metadata.title}`,
-                            "-metadata", `artist=${getAuthorString()}`,
-                            "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
-                            "-c:a", "copy"])
-                          .concat(coverName ? [
-                            "-map", "2:v",
-                            "-metadata:s:v", "title=Album cover",
-                            "-metadata:s:v", "comment=Cover (front)"]
-                            : [])
-                            .concat(["out.mp3"]));
+        const outName = "out." + format.ext;
+        await ffmpeg.exec(format.buildArgs(coverName, metadata, outName));
 
 
 
-        let blob_url = await ffmpeg.readFileToUrl("out.mp3");
+        let blob_url = await ffmpeg.readFileToUrl(outName);
 
         const link = document.createElement('a');
         link.href = blob_url;
 
-        link.download = getAuthorString() + ' - ' + BIF.map.title.main + '.mp3';
+        link.download = getAuthorString() + ' - ' + BIF.map.title.main + '.' + format.ext;
         document.body.appendChild(link);
         link.click();
         link.remove();
@@ -440,7 +484,17 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadState = 0;
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting MP3</b><br>";
-        createAndDownloadMp3(getUrls()).then((p)=>{});
+        createAndDownloadAudio(getUrls(), AUDIO_FORMATS.mp3).then((p)=>{});
+    }
+
+    function exportM4B(){
+        if (downloadState != -1)
+            return;
+
+        downloadState = 0;
+        downloadElem.classList.add("active");
+        downloadElem.innerHTML = "<b>Starting M4B</b><br>";
+        createAndDownloadAudio(getUrls(), AUDIO_FORMATS.m4b).then((p)=>{});
     }
 
 
