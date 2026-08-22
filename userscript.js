@@ -1191,6 +1191,237 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     */
 
     /* =========================================
+              BEGIN MAGAZINE SECTION!
+       =========================================
+    */
+    const magNav = `
+        <div style="text-align: center; width: 100%;">
+           <a class="pLink" id="download"> <h1> Download EPUB </h1> </a>
+        </div>
+    `;
+
+    function isFixedLayoutMagazine(){
+        const safestr = (o) => {
+            const seen = new WeakSet();
+            const r = (k, v) => {
+                if (typeof v === 'object' && v !== null) {
+                    if (seen.has(v)) return undefined;
+                    seen.add(v);
+                }
+                return v;
+            };
+            try { return JSON.stringify(o, r); } catch(e){ return ''; }
+        };
+        const mapStr = safestr(BIF.map);
+        const spine = BIF.map.spine || [];
+        const isFixed = spine.some(c => /pre-paginated/.test(safestr(c.meta || c)));
+        return isFixed && /magazine|issue/i.test(mapStr);
+    }
+
+    async function downloadMagazineEPUB(){
+        const safestr = (o) => {
+            const seen = new WeakSet();
+            const r = (k, v) => {
+                if (typeof v === 'object' && v !== null) {
+                    if (seen.has(v)) return undefined;
+                    seen.add(v);
+                }
+                return v;
+            };
+            try { return JSON.stringify(o, r); } catch(e){ return ''; }
+        };
+        const mapStr = safestr(BIF.map);
+
+        const refs = [...new Set([...mapStr.matchAll(/pages\/[\w.-]+\.jpg/g)].map(m => m[0]))];
+        downloadElem.innerHTML += `Magazine detected. Page images in manifest: ${refs.length}<br>`;
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+
+        if (refs.length < 2) {
+            downloadElem.innerHTML += `<b>WARNING:</b> Only ${refs.length} page image(s) found in manifest; rasters may load dynamically.<br>`;
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            return;
+        }
+
+        const origin = location.origin;
+        const out = new Array(refs.length);
+        let next = 0, done = 0;
+        downloadElem.innerHTML += `Downloading pages <span id="pageAcc">0/${refs.length}</span><br>`;
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+
+        await Promise.all(Array.from({length: Math.min(8, refs.length)}, async () => {
+            while (true) {
+                const i = next++;
+                if (i >= refs.length) break;
+                try {
+                    const res = await fetch(origin + '/' + refs[i]);
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    const blob = await res.blob();
+                    const bmp = await createImageBitmap(blob);
+                    out[i] = { blob, w: bmp.width, h: bmp.height };
+                    bmp.close();
+                } catch(e) {
+                    console.warn('Failed', refs[i], e.message);
+                    out[i] = null;
+                }
+                done += 1;
+                downloadElem.querySelector("#pageAcc").innerHTML = `${done}/${refs.length}`;
+            }
+        }));
+
+        const pageData = [];
+        out.forEach((p, i) => { if (p) pageData.push({ idx: i, ...p }); });
+
+        if (!pageData.length) {
+            downloadElem.innerHTML += `<b>ERROR:</b> No page images could be downloaded.<br>`;
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            return;
+        }
+
+        // ---- article TOC mapping (pageRange-based) ----
+        const tocRaw = (BIF.map.nav && BIF.map.nav.toc) || [];
+        const tocEntries = tocRaw.filter(t => t && t.title && t.pageRange);
+
+        const articles = [];
+        tocEntries.forEach(t => {
+            const firstPageNum = parseInt(String(t.pageRange).split(',')[0].trim(), 10);
+            if (Number.isNaN(firstPageNum)) return;
+            const idx = firstPageNum - 1; // pageRange is 1-indexed
+            if (idx >= 0 && idx < out.length && out[idx]) {
+                articles.push({ title: String(t.title), page: idx });
+            }
+        });
+        const entries = articles.length ? articles : pageData.map(p => ({ title: 'Page ' + (p.idx + 1), page: p.idx }));
+
+        // ---- build EPUB ----
+        const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+        const title = (BIF.map.title && BIF.map.title.main) || 'Magazine';
+        const lang = (BIF.map.language && BIF.map.language[0]) || 'en';
+        const uid = BIF.map['-odread-buid'] || 'magazine';
+
+        const files = [];
+        files.push({ name: 'mimetype', input: 'application/epub+zip' });
+        files.push({ name: 'META-INF/container.xml', input:
+`<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>` });
+
+        const items = [`<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>`,
+                       `<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>`];
+        const spineXml = [];
+
+        downloadElem.innerHTML += `Building EPUB pages <span id="pageBuild">0/${pageData.length}</span><br>`;
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        let bc = 0;
+
+        pageData.forEach(p => {
+            const n = String(p.idx + 1).padStart(4, '0');
+            files.push({ name: `OEBPS/images/p${n}.jpg`, input: p.blob });
+            files.push({ name: `OEBPS/page${n}.xhtml`, input:
+`<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Page ${p.idx+1}</title>
+<meta name="viewport" content="width=${p.w},height=${p.h}"/>
+<style>html,body{margin:0;padding:0;background:#fff}img{width:100%;height:100%;object-fit:contain}body{break-after:page}</style>
+</head><body><img src="images/p${n}.jpg" alt="Page ${p.idx+1}"/></body></html>` });
+            items.push(`<item id="page${n}" href="page${n}.xhtml" media-type="application/xhtml+xml"/>`);
+            items.push(`<item id="img${n}" href="images/p${n}.jpg" media-type="image/jpeg"/>`);
+            spineXml.push(`<itemref idref="page${n}"/>`);
+
+            bc += 1;
+            downloadElem.querySelector("#pageBuild").innerHTML = `${bc}/${pageData.length}`;
+        });
+
+        let np = 0;
+        const navPoints = entries.map(e => {
+            const n = String(e.page + 1).padStart(4, '0');
+            return `<navPoint id="np${++np}" playOrder="${np}"><navLabel><text>${esc(e.title)}</text></navLabel><content src="page${n}.xhtml"/></navPoint>`;
+        }).join('');
+        files.push({ name: 'OEBPS/toc.ncx', input:
+`<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<head><meta name="dtb:uid" content="${esc(uid)}"/></head>
+<docTitle><text>${esc(title)}</text></docTitle>
+<navMap>${navPoints}</navMap>
+</ncx>` });
+
+        const navList = entries.map(e => {
+            const n = String(e.page + 1).padStart(4, '0');
+            return `<li><a href="page${n}.xhtml">${esc(e.title)}</a></li>`;
+        }).join('');
+        files.push({ name: 'OEBPS/nav.xhtml', input:
+`<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Contents</title></head>
+<body><nav epub:type="toc" id="toc"><h1>Contents</h1><ol>${navList}</ol></nav></body></html>` });
+
+        files.push({ name: 'OEBPS/content.opf', input:
+`<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="${esc(lang)}">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="bookid">${esc(uid)}</dc:identifier>
+<dc:title>${esc(title)}</dc:title>
+<dc:language>${esc(lang)}</dc:language>
+<meta property="rendition:layout">pre-paginated</meta>
+<meta property="rendition:spread">none</meta>
+</metadata>
+<manifest>${items.join('')}</manifest>
+<spine toc="ncx">${spineXml.join('')}</spine>
+</package>` });
+
+        downloadElem.innerHTML += "<br><b>Downloads complete!</b> Starting EPUB generation and download...<br>";
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+
+        const zipFn = await getDownloadZip();
+        const zipBlob = await zipFn(files).blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(zipBlob);
+        a.download = title.replace(/[\/:*?"<>|]/g, '_') + '.epub';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(a.href);
+
+        downloadElem.innerHTML += `Done. EPUB saved: ${a.download} (${pageData.length} pages, ${entries.length} TOC entries)<br>`;
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+    }
+
+    function downloadMagazineEPUBBtn(){
+        if (downloadState != -1)
+            return;
+
+        downloadState = 0;
+        downloadElem.classList.add("active");
+        downloadElem.innerHTML = "<b>Starting download</b><br>";
+
+        downloadMagazineEPUB().then(()=>{ downloadState = -1; });
+    }
+
+    // Main entry point for fixed-layout magazines
+    function bifFoundMagazine(){
+        // New global style info
+        let s = document.createElement("style");
+        s.innerHTML = CSS;
+        document.head.appendChild(s)
+
+        let nav = document.createElement("div");
+        nav.innerHTML = magNav;
+        nav.querySelector("#download").onclick = downloadMagazineEPUBBtn;
+        nav.classList.add("pNav");
+        let pbar = document.querySelector(".nav-progress-bar");
+        pbar.insertBefore(nav, pbar.children[1]);
+
+        downloadElem = document.createElement("div");
+        downloadElem.classList.add("foldMenu");
+        downloadElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
+        document.body.appendChild(downloadElem);
+    }
+
+    /* =========================================
+              END MAGAZINE SECTION!
+       =========================================
+    */
+
+    /* =========================================
               BEGIN INITIALIZER SECTION!
        =========================================
     */
@@ -1206,7 +1437,11 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             if (mode == "listen"){
                 bifFoundAudiobook();
             }else if (mode == "read"){
-                bifFoundBook();
+                if (isFixedLayoutMagazine()){
+                    bifFoundMagazine();
+                } else {
+                    bifFoundBook();
+                }
             }
         }
     }, 25);
