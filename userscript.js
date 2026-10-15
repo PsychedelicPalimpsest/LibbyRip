@@ -1283,17 +1283,23 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         });
 
         if (files.some(f => typeof f.input === "string" && /<meta[^>]*name=["']viewport/i.test(f.input))) {
+            const escapeXmlText = value => String(value).replace(/[&<>]/g, ch => ({
+                "&": "&amp;",
+                "<": "&lt;",
+                ">": "&gt;"
+            })[ch]);
+            const escapeXmlAttribute = value => escapeXmlText(value).replace(/"/g, "&quot;").replace(/'/g, "&apos;");
             let navOl = '';
             components.forEach(chapter => {
                 const path = truncate(chapter.meta.path);
                 const label = chapter.meta.title || BIF.map.title.main;
-                navOl += `        <li><a href="${path}">${label}</a></li>\n`;
+                navOl += `        <li><a href="${escapeXmlAttribute(path)}">${escapeXmlText(label)}</a></li>\n`;
             });
             const navDoc = `<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
 <head>
-    <title>${BIF.map.title.main}</title>
+    <title>${escapeXmlText(BIF.map.title.main)}</title>
 </head>
 <body>
     <nav epub:type="toc" id="toc">
