@@ -712,7 +712,8 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 console.warn("No iframe for chapter " + c.id);
                 return;
             }
-            c.meta.id = c.meta.id || crypto.randomUUID()
+            const rawId = c.meta.id || crypto.randomUUID();
+            c.meta.id = (/^[a-zA-Z_]/.test(rawId) ? "" : "chap-") + rawId;
             idToMetaId[c.id] = c.meta.id;
             idToIfram[c.id] = c.sheetBox.querySelector("iframe");
 
@@ -922,7 +923,8 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             if (!(src.startsWith("http://") || src.startsWith("https://"))) {
               src = (new URL(src, new URL(url))).toString();
             }
-            const tr = truncate(src);
+            const cleanSrc = src.split('?')[0].split('#')[0];
+            const tr = truncate(cleanSrc);
             const exists = Array.from(head.querySelectorAll('link[rel="stylesheet"]'))
                 .some(l => l.getAttribute("href") === tr);
             if (!exists) {
@@ -1146,7 +1148,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let components = getBookComponents();
         components.forEach(chapter =>{
             const item = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
-            let id = chapter.meta.id || crypto.randomUUID();
+            let rawId = chapter.meta.id || crypto.randomUUID();
+            let id = (/^[a-zA-Z_]/.test(rawId) ? "" : "chap-") + rawId;
+            chapter.meta.id = id;
             while (idStore.includes(id)) {
               id = id + "-" + crypto.randomUUID();
             }
@@ -1207,7 +1211,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             item.setAttribute('href', aname);
             item.setAttribute('media-type', getMimeTypeFromFileName(aname));
             if (coverHref && aname === coverHref) {
-                item.setAttribute('properties', 'cover-image'); // EPUB 3 cover
+                if (isFixedLayout) {
+                    item.setAttribute('properties', 'cover-image'); // EPUB 3 cover
+                }
                 coverId = id;
             }
             manifest.appendChild(item);
