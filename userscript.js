@@ -773,8 +773,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 if (!imgAssests.includes(absHref)) imgAssests.push(absHref);
             }
 
+            const fileName = truncate((c.meta && c.meta.path) ? c.meta.path : c.id);
             files.push({
-                name: "OEBPS/" + truncate(c.id),
+                name: "OEBPS/" + fileName,
                 input: fixXhtml(idToMetaId[c.id] || c.id, src, chapter.html, imgAssests, cssRegistry[c.id] || [])
             });
             fetched += 1;
@@ -826,7 +827,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                         for (let m of matches) {
                             const fullMatch = m[0];
                             const ref = m[1].trim();
-                            if (ref.startsWith("data:")) continue;
+                            if (ref.startsWith("data:") || ref.startsWith("#")) continue;
                             const absRef = (new URL(ref, new URL(url))).toString();
                             if (!imgAssests.includes(absRef)) {
                                 imgAssests.push(absRef);
@@ -874,14 +875,15 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         doc.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
             const href = link.getAttribute("href");
             if (href) {
-                link.setAttribute("href", truncate(href));
+                const cleanHref = href.split('?')[0].split('#')[0];
+                link.setAttribute("href", truncate(cleanHref));
             }
         });
 
         let imgFound = 0;
         const imgElements = doc.querySelectorAll("img, image");
         for (let el of imgElements) {
-            let src = el.getAttribute("src") || el.getAttribute("xlink:href");
+            let src = el.getAttribute("src") || el.getAttribute("xlink:href") || el.getAttribute("href");
             if (!src) continue;
             imgFound++;
 
@@ -895,6 +897,8 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 el.setAttribute("src", truncate(src));
             if (el.getAttribute("xlink:href"))
                 el.setAttribute("xlink:href", truncate(src));
+            if (el.getAttribute("href"))
+                el.setAttribute("href", truncate(src));
         }
         if (imgFound > 0) console.log(`LibreGRAB: ${metaId}: found ${imgFound} images`);
 
@@ -977,6 +981,28 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         const ext = fileName.split('.').pop().toLowerCase();
         return mimeTypes[ext] || 'application/octet-stream';
     }
+    function detectFixedLayout(files) {
+        for (const f of files) {
+            if (typeof f.input === "string" && /\.(xhtml|html)$/.test(f.name)) {
+                const metaTags = f.input.match(/<meta\s+[^>]*>/gi) || [];
+                for (const tag of metaTags) {
+                    if (/name=["']viewport["']/i.test(tag)) {
+                        let resolution = null;
+                        const cMatch = tag.match(/content=["']([^"']+)["']/i);
+                        if (cMatch) {
+                            const wMatch = cMatch[1].match(/width\s*=\s*([0-9]+(?:\.[0-9]+)?)/i);
+                            const hMatch = cMatch[1].match(/height\s*=\s*([0-9]+(?:\.[0-9]+)?)/i);
+                            if (wMatch && hMatch) {
+                                resolution = `${Math.round(parseFloat(wMatch[1]))}x${Math.round(parseFloat(hMatch[1]))}`;
+                            }
+                        }
+                        return { isFixedLayout: true, originalResolution: resolution };
+                    }
+                }
+            }
+        }
+        return { isFixedLayout: false, originalResolution: null };
+    }
     function makePackage(files, assetRegistry){
         const idStore = [];
         const doc = document.implementation.createDocument(
@@ -985,22 +1011,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             null // do not specify a doctype
         );
 
-        let isFixedLayout = false;
-        let originalResolution = null;
-        for (const f of files) {
-            if (typeof f.input === "string" && /\.(xhtml|html)$/.test(f.name)) {
-                const vpMatch = f.input.match(/<meta[^>]*name=["']viewport["'][^>]*content=["']([^"']+)["']/i);
-                if (vpMatch) {
-                    isFixedLayout = true;
-                    const wMatch = vpMatch[1].match(/width\s*=\s*([0-9]+(?:\.[0-9]+)?)/i);
-                    const hMatch = vpMatch[1].match(/height\s*=\s*([0-9]+(?:\.[0-9]+)?)/i);
-                    if (wMatch && hMatch) {
-                        originalResolution = `${Math.round(parseFloat(wMatch[1]))}x${Math.round(parseFloat(hMatch[1]))}`;
-                    }
-                    break;
-                }
-            }
-        }
+        const { isFixedLayout, originalResolution } = detectFixedLayout(files);
 
         // Step 2: Set attributes for the root element
         const packageElement = doc.documentElement;
@@ -1159,10 +1170,10 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         // (without cover metadata, they guess — sometimes wrongly).
         function imgSrcOf(html, onlyDocCover) {
             const tag = html.match(onlyDocCover
-                ? /<img[^>]*role=["']doc-cover["'][^>]*>/i
-                : /<img[^>]*>/i);
+                ? /<(?:img|image)[^>]*role=["']doc-cover["'][^>]*>/i
+                : /<(?:img|image)[^>]*>/i);
             if (!tag) return null;
-            const src = tag[0].match(/src=["']([^"']+)["']/i);
+            const src = tag[0].match(/(?:src|xlink:href|href)=["']([^"']+)["']/i);
             return src ? src[1] : null;
         }
         function isChapterFile(f) {
@@ -1186,7 +1197,8 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         assetRegistry.forEach(asset => {
             const item = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
             let aname = asset.startsWith("http") ? getFilenameFromURL(asset) : asset;
-            let id = aname.split(".")[0];
+            let rawId = aname.split(".")[0];
+            let id = (/^[a-zA-Z_]/.test(rawId) ? "" : "asset-") + rawId;
             while (idStore.includes(id)) {
               id = id + "-" + crypto.randomUUID();
             }
@@ -1253,18 +1265,19 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
         let components = getBookComponents();
 
-        components.forEach(chapter =>{
+        components.forEach((chapter, idx) =>{
             // First navPoint
             const navPoint1 = doc.createElementNS('http://www.daisy.org/z3986/2005/ncx/', 'navPoint');
-            navPoint1.setAttribute('id', chapter.meta.id);
-            navPoint1.setAttribute('playOrder', '' + (1+chapter.index));
+            navPoint1.setAttribute('id', chapter.meta.id || ("nav-" + (idx + 1)));
+            const order = (chapter.index !== undefined) ? (1 + chapter.index) : (idx + 1);
+            navPoint1.setAttribute('playOrder', '' + order);
             navMap.appendChild(navPoint1);
 
             const navLabel1 = doc.createElementNS('http://www.daisy.org/z3986/2005/ncx/', 'navLabel');
             navPoint1.appendChild(navLabel1);
 
             const text1 = doc.createElementNS('http://www.daisy.org/z3986/2005/ncx/', 'text');
-            text1.textContent = BIF.map.title.main;
+            text1.textContent = (chapter.meta && chapter.meta.title) ? chapter.meta.title : BIF.map.title.main;
             navLabel1.appendChild(text1);
 
             const content1 = doc.createElementNS('http://www.daisy.org/z3986/2005/ncx/', 'content');
@@ -1282,7 +1295,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             input: `<?xml version="1.0" encoding="utf-8" standalone="no"?>\n` + xmlString
         });
 
-        if (files.some(f => typeof f.input === "string" && /<meta[^>]*name=["']viewport/i.test(f.input))) {
+        if (detectFixedLayout(files).isFixedLayout) {
             const escapeXmlText = value => String(value).replace(/[&<>]/g, ch => ({
                 "&": "&amp;",
                 "<": "&lt;",
@@ -1347,7 +1360,7 @@ ${navOl}        </ol>
 
         await createContent(files, imageAssets);
 
-        const isFixedLayout = files.some(f => typeof f.input === "string" && /<meta[^>]*name=["']viewport/i.test(f.input));
+        const isFixedLayout = detectFixedLayout(files).isFixedLayout;
         if (isFixedLayout) {
             files.push({
                 name: "META-INF/com.apple.ibooks.display-options.xml",
