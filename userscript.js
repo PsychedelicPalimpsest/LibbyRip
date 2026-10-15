@@ -701,6 +701,12 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>chapterUrl(page)).length}/${totComp}`;
         });
 
+        const chaptersWithoutUrl = components.filter((page)=>!chapterUrl(page));
+        if (chaptersWithoutUrl.length) {
+            throw new Error(`Could not load ${chaptersWithoutUrl.length} of ${totComp} chapters before the timeout: ` +
+                chaptersWithoutUrl.map(page=>page.id).join(", "));
+        }
+
         downloadElem.innerHTML += `Chapter gathering complete<br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
@@ -740,29 +746,25 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         for (let c of components){
             const src = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
             if (!src){
-                console.warn("No chapter URL for " + c.id + ", skipping");
-                continue;
+                throw new Error("No chapter URL for " + c.id);
             }
             let res;
+            let shellHtml;
+            const controller = new AbortController();
+            const fetchTimeout = setTimeout(()=>controller.abort(), 30000);
             try {
-                res = await fetch(src, {credentials: "include"});
+                res = await fetch(src, {credentials: "include", signal: controller.signal});
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                shellHtml = await res.text();
             } catch(e) {
-                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id}: ${e}<br>`;
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                continue;
+                const reason = e && e.name === "AbortError" ? "timed out after 30 seconds" : String(e);
+                throw new Error(`Could not fetch chapter ${c.id}: ${reason}`);
+            } finally {
+                clearTimeout(fetchTimeout);
             }
-            if (!res.ok) {
-                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id} (HTTP ${res.status})<br>`;
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                continue;
-            }
-            const chapter = decryptChapterShell(await res.text());
+            const chapter = decryptChapterShell(shellHtml);
             if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
-                const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
-                    ") - page will be empty";
-                console.warn(msg);
-                downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                throw new Error(`Could not decode chapter ${c.id} (unexpected shell: ${chapter.status})`);
             }
             // Also extract stylesheets directly from chapter shell HTML
             const linkHrefMatches = chapter.html.matchAll(/<link[^>]+href=["']([^"']+)["'][^>]*>/gi);
@@ -1470,7 +1472,15 @@ ${navOl}        </ol>
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting download</b><br>";
 
-        downloadEPUB().then(()=>{});
+        downloadEPUB().catch(error=>{
+            console.error("EPUB export failed", error);
+            const errorElem = document.createElement("div");
+            errorElem.innerHTML = "<b>EPUB export failed:</b> ";
+            errorElem.appendChild(document.createTextNode(error && error.message ? error.message : String(error)));
+            downloadElem.appendChild(errorElem);
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            downloadState = -1;
+        });
     }
     function buildBookPirateUi(){
         // Create the nav
