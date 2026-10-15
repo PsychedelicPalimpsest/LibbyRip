@@ -1,15 +1,19 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-06-01
+// @version       2026-10-11
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
 // @supportURL    https://github.com/PsychedelicPalimpsest/LibbyRip/issues
+// @match         *://read.libbyapp.com/*
+// @match         *://*.read.libbyapp.com/*
+// @match         *://read.overdrive.com/*
+// @match         *://*.read.overdrive.com/*
+// @match         *://listen.libbyapp.com/*
 // @match         *://*.listen.libbyapp.com/*
+// @match         *://listen.overdrive.com/*
 // @match         *://*.listen.overdrive.com/*
-// @match         *://*.read.libbyapp.com/?*
-// @match         *://*.read.overdrive.com/?*
 // @run-at        document-start
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
 // @grant         none
@@ -589,45 +593,78 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
            <a class="pLink" id="download"> <h1> Download EPUB </h1> </a>
         </div>
     `;
-    const pages = window.pages = {};
 
-    // Libby used the bind method as a way to "safely" expose
-    // the decryption module. THIS IS THEIR DOWNFALL.
-    // As we can hook bind, allowing us to obtain the
-    // decryption function
-    const originalBind = Function.prototype.bind;
-    Function.prototype.bind = function(...args) {
-        const boundFn = originalBind.apply(this, args);
+    // NOTE: Libby used to expose chapter decryption client-side (via a
+    // Function.prototype.bind hook that captured the decryption function, and
+    // a window.__bif_cfc1 callback that fed a window.pages index). As of
+    // ~Oct 2026 the libbyapp.com reader serves chapters pre-decrypted from
+    // signed URLs, so that whole mechanism was removed (2026-10-11 cleanup).
 
-        // Store bound arguments (excluding `this`) for potential decryption function
-        boundFn.__boundArgs = args.slice(1);
 
-        // Also store the original function for debugging
-        boundFn.__originalFunction = this;
-
-        // If this looks like a decryption function, store it globally
-        if (this.toString().includes('decryption') ||
-            args.some(arg => typeof arg === 'function' && arg.toString().includes('decryption'))) {
-            console.log("Decryption function detected:", this);
-            window.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
+    // Libby (as of ~Oct 2026 on the libbyapp.com reader) serves every chapter as
+    // plain, already-decrypted XHTML from a signed per-chapter URL, so there is
+    // no client-side decryption step anymore: a chapter is ready as soon as its
+    // iframe has a src.
+    function chapterUrl(c){
+        const f = c.sheetBox && c.sheetBox.querySelector("iframe");
+        return (f && f.src) ? f.src : null;
+    }
+    // Libby encrypts chapter bodies client-side (bifocal "rumi" module). Each
+    // chapter shell is just <head> (styles) + <body><script>
+    // parent.__bif_cfc1(self,'<edata>')</script></body>. The edata is base64
+    // with every 4-char group's 1st and 4th characters swapped; decoding it
+    // yields the real <body>...</body> HTML. This replicates Libby's own
+    // __bif_cfc1 decryptor so the download doesn't depend on their globals.
+    //
+    // Returns {html, status}. Status is one of:
+    //   "decrypted"     - payload found and decrypted into a real <body>
+    //   "unencrypted"   - no payload and no <script> in the body (cover, title, ...)
+    //   "unknown-shell" - no payload match, but the body holds a <script>:
+    //                     the shell format changed and we cannot decrypt it
+    //   "decrypt-failed"- payload found but the transform threw
+    //   "bad-payload"   - payload decrypted to something that is not a <body>
+    function decryptChapterShell(shellHtml){
+        const m = shellHtml.match(/parent\.__bif_cfc1\(self,'([^']+)'\)/)
+               || shellHtml.match(/parent\.__bif_cfc0\(self,'([^']+)'\)/);
+        if (!m){
+            const hasScript = /<body[^>]*>[\s\S]*<script/i.test(shellHtml);
+            return {html: shellHtml, status: hasScript ? "unknown-shell" : "unencrypted"};
         }
-
-        return boundFn;
-    };
-
+        const isCfc1 = shellHtml.includes("__bif_cfc1");
+        let decrypted;
+        try{
+            const raw = m[1];
+            decrypted = atob(isCfc1 ? raw.replace(/(.)(.)(.)(.)/g, "$4$2$3$1") : raw);
+        }catch(e){
+            return {html: shellHtml, status: "decrypt-failed"};
+        }
+        if (!/^\s*<body/i.test(decrypted)){
+            return {html: shellHtml, status: "bad-payload"};
+        }
+        // Splice the decrypted <body> into the shell, keeping its <head> (styles).
+        const spliced = shellHtml.replace(/<body[^>]*>[\s\S]*<\/body>/i, ()=>decrypted);
+        return {html: spliced !== shellHtml ? spliced : shellHtml, status: "decrypted"};
+    }
 
     async function waitForChapters(callback){
         let components = getBookComponents();
         // Force all the chapters to load in.
         components.forEach(page =>{
-            if (undefined != window.pages[page.id]) return;
+            if (chapterUrl(page)) return;
             page._loadContent({callback: ()=>{}})
         });
-        // But its not instant, so we need to wait until they are all set (see: bifFound())
-        while (components.filter((page)=>undefined==window.pages[page.id]).length){
+        // But its not instant, so we need to wait until they are all set.
+        // Give up after 2 minutes rather than hanging forever.
+        const deadline = Date.now() + 120000;
+        while (components.filter((page)=>!chapterUrl(page)).length){
+            if (Date.now() > deadline){
+                console.warn("Timed out waiting for chapters: " +
+                    components.filter((page)=>!chapterUrl(page)).map(p=>p.id).join(", "));
+                break;
+            }
             await new Promise(r => setTimeout(r, 100));
             callback();
-            console.log(components.filter((page)=>undefined==window.pages[page.id]).length);
+            console.log(components.filter((page)=>!chapterUrl(page)).length);
         }
     }
     function getBookComponents(){
@@ -661,8 +698,14 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let gc = 0;
         await waitForChapters(()=>{
             gc+=1;
-            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=window.pages[page.id]).length}/${totComp}`;
+            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>chapterUrl(page)).length}/${totComp}`;
         });
+
+        const chaptersWithoutUrl = components.filter((page)=>!chapterUrl(page));
+        if (chaptersWithoutUrl.length) {
+            throw new Error(`Could not load ${chaptersWithoutUrl.length} of ${totComp} chapters before the timeout: ` +
+                chaptersWithoutUrl.map(page=>page.id).join(", "));
+        }
 
         downloadElem.innerHTML += `Chapter gathering complete<br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
@@ -672,100 +715,203 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         components.forEach(c=>{
             // Nothing that can be done here...
             if (c.sheetBox.querySelector("iframe") == null){
-                console.warn("!!!" + window.pages[c.id]);
+                console.warn("No iframe for chapter " + c.id);
                 return;
             }
-            c.meta.id = c.meta.id || crypto.randomUUID()
+            const rawId = c.meta.id || crypto.randomUUID();
+            c.meta.id = (/^[a-zA-Z_]/.test(rawId) ? "" : "chap-") + rawId;
             idToMetaId[c.id] = c.meta.id;
             idToIfram[c.id] = c.sheetBox.querySelector("iframe");
 
-            c.sheetBox.querySelector("iframe").contentWindow.document.querySelectorAll("link").forEach(link=>{
-                cssRegistry[c.id] = cssRegistry[c.id] || [];
-                cssRegistry[c.id].push(link.href);
+            try {
+                const frameDoc = c.sheetBox.querySelector("iframe").contentWindow.document;
+                if (frameDoc) {
+                    frameDoc.querySelectorAll("link").forEach(link=>{
+                        if (!link.href) return;
+                        cssRegistry[c.id] = cssRegistry[c.id] || [];
+                        cssRegistry[c.id].push(link.href);
 
-                if (imgAssests.includes(link.href)) return;
-                imgAssests.push(link.href);
-
-
-            });
+                        if (imgAssests.includes(link.href)) return;
+                        imgAssests.push(link.href);
+                    });
+                }
+            } catch (e) {
+                console.warn("Could not read iframe link elements for " + c.id, e);
+            }
         });
-        let url = location.origin;
-        for (let i of Object.keys(window.pages)){
-            if (idToIfram[i])
-                url = idToIfram[i].src;
+        // Chapters are fetched from their signed iframe URLs, then decrypted
+        // client-side (see decryptChapterShell): the served HTML is only a
+        // shell holding an encrypted payload.
+        let fetched = 0;
+        for (let c of components){
+            const src = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
+            if (!src){
+                throw new Error("No chapter URL for " + c.id);
+            }
+            let res;
+            let shellHtml;
+            const controller = new AbortController();
+            const fetchTimeout = setTimeout(()=>controller.abort(), 30000);
+            try {
+                res = await fetch(src, {credentials: "include", signal: controller.signal});
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                shellHtml = await res.text();
+            } catch(e) {
+                const reason = e && e.name === "AbortError" ? "timed out after 30 seconds" : String(e);
+                throw new Error(`Could not fetch chapter ${c.id}: ${reason}`);
+            } finally {
+                clearTimeout(fetchTimeout);
+            }
+            const chapter = decryptChapterShell(shellHtml);
+            if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
+                throw new Error(`Could not decode chapter ${c.id} (unexpected shell: ${chapter.status})`);
+            }
+            // Also extract stylesheets directly from chapter shell HTML
+            const linkHrefMatches = chapter.html.matchAll(/<link[^>]+href=["']([^"']+)["'][^>]*>/gi);
+            for (let m of linkHrefMatches) {
+                const rawHref = m[1];
+                const absHref = (rawHref.startsWith("http://") || rawHref.startsWith("https://")) ? rawHref : (new URL(rawHref, new URL(src))).toString();
+                cssRegistry[c.id] = cssRegistry[c.id] || [];
+                if (!cssRegistry[c.id].includes(absHref)) cssRegistry[c.id].push(absHref);
+                if (!imgAssests.includes(absHref)) imgAssests.push(absHref);
+            }
+
+            const fileName = truncate((c.meta && c.meta.path) ? c.meta.path : c.id);
             files.push({
-                name: "OEBPS/" + truncate(i),
-                input: fixXhtml(idToMetaId[i], url, window.pages[i], imgAssests, cssRegistry[i] || [])
+                name: "OEBPS/" + fileName,
+                input: fixXhtml(idToMetaId[c.id] || c.id, src, chapter.html, imgAssests, cssRegistry[c.id] || [])
             });
+            fetched += 1;
+            const acc = downloadElem.querySelector("span#chapAcc");
+            if (acc) acc.innerHTML = ` ${fetched}/${totComp}`;
         }
 
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
+        // Download assets with bounded concurrency and retries. Firing off
+        // hundreds of requests at once can get throttled (HTTP 429) by the
+        // CDN, and a single failed fetch used to mean a broken image/asset
+        // with no second chance.
+        const ASSET_CONCURRENCY = 6;
+        const ASSET_MAX_ATTEMPTS = 3;
+        async function fetchAssetWithRetry(url) {
+            let lastError = "unknown error";
+            for (let attempt = 1; attempt <= ASSET_MAX_ATTEMPTS; attempt++) {
+                try {
+                    const response = await fetch(url);
+                    if (response.status === 200) return response;
+                    lastError = "HTTP " + response.status;
+                    // Retry throttling and server errors; other 4xx won't recover.
+                    if (response.status !== 429 && response.status < 500) break;
+                } catch (e) {
+                    lastError = (e && e.message) ? e.message : String(e);
+                }
+                if (attempt < ASSET_MAX_ATTEMPTS) {
+                    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+                }
+            }
+            throw new Error(lastError);
+        }
 
         gc = 0;
-        await Promise.all(imgAssests.map(name=>(async function(){
-            const response = await fetch(name.startsWith("http") ? name : location.origin + "/" + name);
-            if (response.status != 200) {
-                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch ${name}<br>`
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                return;
+        const assetQueue = imgAssests.slice();
+        async function assetWorker() {
+            while (assetQueue.length) {
+                const name = assetQueue.shift();
+                const url = name.startsWith("http") ? name : location.origin + "/" + name;
+                try {
+                    const response = await fetchAssetWithRetry(url);
+                    const isCss = name.includes(".css") || (response.headers.get("content-type") || "").includes("text/css");
+                    if (isCss) {
+                        let cssText = await response.text();
+                        const urlRegex = /url\(\s*["']?([^"'\)]+)["']?\s*\)/g;
+                        const matches = Array.from(cssText.matchAll(urlRegex));
+                        for (let m of matches) {
+                            const fullMatch = m[0];
+                            const ref = m[1].trim();
+                            if (ref.startsWith("data:") || ref.startsWith("#")) continue;
+                            const absRef = (new URL(ref, new URL(url))).toString();
+                            if (!imgAssests.includes(absRef)) {
+                                imgAssests.push(absRef);
+                                assetQueue.push(absRef);
+                            }
+                            const localName = getFilenameFromURL(absRef);
+                            cssText = cssText.replaceAll(fullMatch, "url('" + localName + "')");
+                        }
+                        files.push({
+                            name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
+                            input: cssText
+                        });
+                    } else {
+                        const blob = await response.blob();
+                        files.push({
+                            name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
+                            input: blob
+                        });
+                    }
+                } catch (e) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch ${name} (${e.message})<br>`
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                }
+                gc += 1;
+                const assetSpan = downloadElem.querySelector("span#assetGath");
+                if (assetSpan) assetSpan.innerHTML = ` ${gc}/${imgAssests.length} `;
             }
-            const blob = await response.blob();
-
-            files.push({
-                name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
-                input: blob
-            });
-
-            gc+=1;
-            downloadElem.querySelector("span#assetGath").innerHTML = ` ${gc}/${imgAssests.length} `;
-        })()));
+        }
+        await Promise.all(
+            Array.from({length: Math.min(ASSET_CONCURRENCY, assetQueue.length)}, assetWorker)
+        );
     }
     function enforceEpubXHTML(metaId, url, htmlString, assetRegistry, links) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(htmlString, 'text/html');
         const bod = doc.querySelector("body");
         if (bod){
-            bod.setAttribute("id", metaId);
+            const usedIds = new Set(Array.from(doc.querySelectorAll("[id]"))
+                .filter(el => el !== bod)
+                .map(el => el.getAttribute("id")));
+            let bodyId = metaId;
+            let suffix = 1;
+            while (usedIds.has(bodyId)) {
+                bodyId = `${metaId}-body-${suffix++}`;
+            }
+            bod.setAttribute("id", bodyId);
         }
 
-        // Convert all elements to lowercase tag names
-        const elements = doc.getElementsByTagName('*');
-        for (let el of elements) {
-            const newElement = doc.createElement(el.tagName.toLowerCase());
+        // Remove <base> tags: EPUB forbids them and they break relative resource paths
+        doc.querySelectorAll("base").forEach(b => b.remove());
 
-            // Copy attributes to the new element
-            for (let attr of el.attributes) {
-                newElement.setAttribute(attr.name, attr.value);
+        // Rewrite existing stylesheet links in the shell head to local OEBPS files
+        doc.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
+            const href = link.getAttribute("href");
+            if (href) {
+                const cleanHref = href.split('?')[0].split('#')[0];
+                link.setAttribute("href", truncate(cleanHref));
             }
+        });
 
-            // Move child nodes to the new element
-            while (el.firstChild) {
-                newElement.appendChild(el.firstChild);
+        let imgFound = 0;
+        const imgElements = doc.querySelectorAll("img, image");
+        for (let el of imgElements) {
+            let src = el.getAttribute("src") || el.getAttribute("xlink:href") || el.getAttribute("href");
+            if (!src) continue;
+            imgFound++;
+
+            if (!(src.startsWith("http://") || src.startsWith("https://"))){
+                src = (new URL(src, new URL(url))).toString();
             }
+            if (!assetRegistry.includes(src))
+                assetRegistry.push(src);
 
-            // Replace old element with the new one
-            el.parentNode.replaceChild(newElement, el);
+            if (el.getAttribute("src"))
+                el.setAttribute("src", truncate(src));
+            if (el.getAttribute("xlink:href"))
+                el.setAttribute("xlink:href", truncate(src));
+            if (el.getAttribute("href"))
+                el.setAttribute("href", truncate(src));
         }
-
-        for (let el of elements) {
-            if (el.tagName.toLowerCase() == "img" || el.tagName.toLowerCase() == "image"){
-                let src = el.getAttribute("src") || el.getAttribute("xlink:href");
-                if (!src) continue;
-
-                if (!(src.startsWith("http://") ||  src.startsWith("https://"))){
-                    src = (new URL(src, new URL(url))).toString();
-                }
-                if (!assetRegistry.includes(src))
-                    assetRegistry.push(src);
-
-                if (el.getAttribute("src"))
-                    el.setAttribute("src", truncate(src));
-                if (el.getAttribute("xlink:href"))
-                    el.setAttribute("xlink:href", truncate(src));
-            }
-        }
+        if (imgFound > 0) console.log(`LibreGRAB: ${metaId}: found ${imgFound} images`);
 
 
         // Ensure the <head> element exists with a <title>
@@ -787,11 +933,17 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             if (!(src.startsWith("http://") || src.startsWith("https://"))) {
               src = (new URL(src, new URL(url))).toString();
             }
-            let linkElement = doc.createElement('link');
-            linkElement.setAttribute("href", truncate(src));
-            linkElement.setAttribute("rel", "stylesheet");
-            linkElement.setAttribute("type", "text/css");
-            head.appendChild(linkElement);
+            const cleanSrc = src.split('?')[0].split('#')[0];
+            const tr = truncate(cleanSrc);
+            const exists = Array.from(head.querySelectorAll('link[rel="stylesheet"]'))
+                .some(l => l.getAttribute("href") === tr);
+            if (!exists) {
+                let linkElement = doc.createElement('link');
+                linkElement.setAttribute("href", tr);
+                linkElement.setAttribute("rel", "stylesheet");
+                linkElement.setAttribute("type", "text/css");
+                head.appendChild(linkElement);
+            }
         }
 
         // Get the serialized XHTML string
@@ -827,13 +979,41 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             pdf: 'application/pdf',
             txt: 'text/plain',
             html: 'text/html',
+            xhtml: 'application/xhtml+xml',
             css: 'text/css',
             json: 'application/json',
-            // Add more extensions as needed
+            otf: 'font/otf',
+            ttf: 'font/ttf',
+            woff: 'font/woff',
+            woff2: 'font/woff2',
+            svg: 'image/svg+xml',
+            ncx: 'application/x-dtbncx+xml',
         };
 
         const ext = fileName.split('.').pop().toLowerCase();
         return mimeTypes[ext] || 'application/octet-stream';
+    }
+    function detectFixedLayout(files) {
+        for (const f of files) {
+            if (typeof f.input === "string" && /\.(xhtml|html)$/.test(f.name)) {
+                const metaTags = f.input.match(/<meta\s+[^>]*>/gi) || [];
+                for (const tag of metaTags) {
+                    if (/name=["']viewport["']/i.test(tag)) {
+                        let resolution = null;
+                        const cMatch = tag.match(/content=["']([^"']+)["']/i);
+                        if (cMatch) {
+                            const wMatch = cMatch[1].match(/width\s*=\s*([0-9]+(?:\.[0-9]+)?)/i);
+                            const hMatch = cMatch[1].match(/height\s*=\s*([0-9]+(?:\.[0-9]+)?)/i);
+                            if (wMatch && hMatch) {
+                                resolution = `${Math.round(parseFloat(wMatch[1]))}x${Math.round(parseFloat(hMatch[1]))}`;
+                            }
+                        }
+                        return { isFixedLayout: true, originalResolution: resolution };
+                    }
+                }
+            }
+        }
+        return { isFixedLayout: false, originalResolution: null };
     }
     function makePackage(files, assetRegistry){
         const idStore = [];
@@ -843,15 +1023,36 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             null // do not specify a doctype
         );
 
+        const { isFixedLayout, originalResolution } = detectFixedLayout(files);
+
+        // EPUB 2 content documents use the XHTML 1.1 vocabulary. The source
+        // reader adds data-* annotations that are useful in its own DOM but
+        // are not valid XHTML 1.1, and XMLSerializer omits the XHTML doctype.
+        if (!isFixedLayout) {
+            const xhtml11Doctype = '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">';
+            for (const file of files) {
+                if (!/\.(xhtml|html)$/i.test(file.name) || typeof file.input !== 'string') continue;
+                file.input = file.input.replace(/\sdata-[\w:.-]+=(?:"[^"]*"|'[^']*')/gi, '');
+                if (/<!doctype\s+html[^>]*>/i.test(file.input)) {
+                    file.input = file.input.replace(/<!doctype\s+html[^>]*>/i, xhtml11Doctype);
+                } else {
+                    file.input = file.input.replace(/^(<\?xml[^?]*\?>)/i, `$1\n${xhtml11Doctype}`);
+                }
+            }
+        }
+
         // Step 2: Set attributes for the root element
         const packageElement = doc.documentElement;
-        packageElement.setAttribute('version', '2.0');
-        packageElement.setAttribute('xml:lang', 'en');
+        packageElement.setAttribute('version', isFixedLayout ? '3.0' : '2.0');
+        if (isFixedLayout) packageElement.setAttribute('xml:lang', 'en');
         packageElement.setAttribute('unique-identifier', 'pub-identifier');
         packageElement.setAttribute('xmlns', 'http://www.idpf.org/2007/opf');
         packageElement.setAttribute('xmlns:dc', 'http://purl.org/dc/elements/1.1/');
         packageElement.setAttribute('xmlns:dcterms', 'http://purl.org/dc/terms/');
         packageElement.setAttribute('xmlns:xsi', 'http://www.w3.org/2001/XMLSchema-instance');
+        if (isFixedLayout) {
+            packageElement.setAttribute('prefix', 'rendition: http://www.idpf.org/vocab/rendition/# ibooks: http://vocabulary.itunes.apple.com/rdf/ibooks/vocabulary-extensions-1.0/');
+        }
 
         // Step 3: Create and append child elements to the root
         const metadata = doc.createElementNS('http://www.idpf.org/2007/opf', 'metadata');
@@ -864,20 +1065,22 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         metadata.appendChild(dcIdentifier);
 
         // Language
-        if (BIF.map.language.length){
+        if (BIF.map.language){
             const dcLanguage = doc.createElementNS('http://purl.org/dc/elements/1.1/', 'dc:language');
-            dcLanguage.setAttribute('xsi:type', 'dcterms:RFC4646');
-            dcLanguage.textContent = BIF.map.language[0];
-            packageElement.setAttribute('xml:lang', BIF.map.language[0]);
+            let lang = Array.isArray(BIF.map.language) ? BIF.map.language[0] : (BIF.map.language || "en");
+            dcLanguage.textContent = lang;
+            if (isFixedLayout) packageElement.setAttribute('xml:lang', lang);
             metadata.appendChild(dcLanguage);
         }
 
         // Identifier
-        const metaIdentifier = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
-        metaIdentifier.setAttribute('id', 'meta-identifier');
-        metaIdentifier.setAttribute('property', 'dcterms:identifier');
-        metaIdentifier.textContent = "" + BIF.map["-odread-buid"];
-        metadata.appendChild(metaIdentifier);
+        if (isFixedLayout) {
+            const metaIdentifier = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            metaIdentifier.setAttribute('id', 'meta-identifier');
+            metaIdentifier.setAttribute('property', 'dcterms:identifier');
+            metaIdentifier.textContent = "" + BIF.map["-odread-buid"];
+            metadata.appendChild(metaIdentifier);
+        }
 
         // Title
         const dcTitle = doc.createElementNS('http://purl.org/dc/elements/1.1/', 'dc:title');
@@ -905,6 +1108,45 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             metadata.appendChild(dcDescription);
         }
 
+        if (isFixedLayout) {
+            const metaRenditionLayout = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            metaRenditionLayout.setAttribute('property', 'rendition:layout');
+            metaRenditionLayout.textContent = 'pre-paginated';
+            metadata.appendChild(metaRenditionLayout);
+
+            const metaRenditionOrientation = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            metaRenditionOrientation.setAttribute('property', 'rendition:orientation');
+            metaRenditionOrientation.textContent = 'auto';
+            metadata.appendChild(metaRenditionOrientation);
+
+            const metaRenditionSpread = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            metaRenditionSpread.setAttribute('property', 'rendition:spread');
+            metaRenditionSpread.textContent = 'auto';
+            metadata.appendChild(metaRenditionSpread);
+
+            const metaIbooksFonts = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            metaIbooksFonts.setAttribute('property', 'ibooks:specified-fonts');
+            metaIbooksFonts.textContent = 'true';
+            metadata.appendChild(metaIbooksFonts);
+
+            const metaModified = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            metaModified.setAttribute('property', 'dcterms:modified');
+            metaModified.textContent = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+            metadata.appendChild(metaModified);
+
+            const metaFixedLayout = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            metaFixedLayout.setAttribute('name', 'fixed-layout');
+            metaFixedLayout.setAttribute('content', 'true');
+            metadata.appendChild(metaFixedLayout);
+
+            if (originalResolution) {
+                const metaOriginalRes = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+                metaOriginalRes.setAttribute('name', 'original-resolution');
+                metaOriginalRes.setAttribute('content', originalResolution);
+                metadata.appendChild(metaOriginalRes);
+            }
+        }
+
         // Step 4: Create the manifest, spine, guide, and other sections...
         const manifest = doc.createElementNS('http://www.idpf.org/2007/opf', 'manifest');
         packageElement.appendChild(manifest);
@@ -920,12 +1162,22 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         item.setAttribute('media-type', 'application/x-dtbncx+xml');
         manifest.appendChild(item);
 
+        if (isFixedLayout) {
+            const navItem = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
+            navItem.setAttribute('id', 'nav');
+            navItem.setAttribute('href', 'nav.xhtml');
+            navItem.setAttribute('media-type', 'application/xhtml+xml');
+            navItem.setAttribute('properties', 'nav');
+            manifest.appendChild(navItem);
+        }
 
         // Generate out the manifest
         let components = getBookComponents();
         components.forEach(chapter =>{
             const item = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
-            let id = chapter.meta.id || crypto.randomUUID();
+            let rawId = chapter.meta.id || crypto.randomUUID();
+            let id = (/^[a-zA-Z_]/.test(rawId) ? "" : "chap-") + rawId;
+            chapter.meta.id = id;
             while (idStore.includes(id)) {
               id = id + "-" + crypto.randomUUID();
             }
@@ -933,19 +1185,56 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             idStore.push(id);
             item.setAttribute('href', truncate(chapter.meta.path));
             item.setAttribute('media-type', 'application/xhtml+xml');
+            const chapterFile = files.find(f => f.name === "OEBPS/" + truncate(chapter.meta.path));
+            if (isFixedLayout && chapterFile && typeof chapterFile.input === "string" &&
+                /<(?:[A-Za-z_][\w.-]*:)?svg(?:\s|>)/i.test(chapterFile.input)) {
+                item.setAttribute('properties', 'svg');
+            }
             manifest.appendChild(item);
 
 
             const itemref = doc.createElementNS('http://www.idpf.org/2007/opf', 'itemref');
             itemref.setAttribute('idref', id); // Use the same id as the manifest item
             itemref.setAttribute('linear', "yes");
+            if (isFixedLayout) {
+                itemref.setAttribute('properties', 'rendition:layout-pre-paginated');
+            }
             spine.appendChild(itemref);
         });
+
+        // Identify the cover image so readers pick the right thumbnail
+        // (without cover metadata, they guess — sometimes wrongly).
+        function imgSrcOf(html, onlyDocCover) {
+            const tag = html.match(onlyDocCover
+                ? /<(?:img|image)[^>]*role=["']doc-cover["'][^>]*>/i
+                : /<(?:img|image)[^>]*>/i);
+            if (!tag) return null;
+            const src = tag[0].match(/(?:src|xlink:href|href)=["']([^"']+)["']/i);
+            return src ? src[1] : null;
+        }
+        function isChapterFile(f) {
+            return typeof f.input === "string" && /\.(xhtml|html)$/.test(f.name);
+        }
+        let coverHref = null;
+        // An image explicitly marked as the cover wins, wherever it is.
+        for (const f of files) {
+            if (!isChapterFile(f)) continue;
+            coverHref = imgSrcOf(f.input, true);
+            if (coverHref) break;
+        }
+        // Otherwise, the first image of the first spine chapter
+        // (chapter files are pushed in spine order).
+        if (!coverHref) {
+            const firstChapter = files.find(isChapterFile);
+            if (firstChapter) coverHref = imgSrcOf(firstChapter.input, false);
+        }
+        let coverId = null;
 
         assetRegistry.forEach(asset => {
             const item = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
             let aname = asset.startsWith("http") ? getFilenameFromURL(asset) : asset;
-            let id = aname.split(".")[0];
+            let rawId = aname.split(".")[0];
+            let id = (/^[a-zA-Z_]/.test(rawId) ? "" : "asset-") + rawId;
             while (idStore.includes(id)) {
               id = id + "-" + crypto.randomUUID();
             }
@@ -953,8 +1242,21 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             idStore.push(id);
             item.setAttribute('href', aname);
             item.setAttribute('media-type', getMimeTypeFromFileName(aname));
+            if (coverHref && aname === coverHref) {
+                if (isFixedLayout) {
+                    item.setAttribute('properties', 'cover-image'); // EPUB 3 cover
+                }
+                coverId = id;
+            }
             manifest.appendChild(item);
         });
+
+        if (coverId) {
+            const coverMeta = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            coverMeta.setAttribute('name', 'cover'); // EPUB 2 cover
+            coverMeta.setAttribute('content', coverId);
+            metadata.appendChild(coverMeta);
+        }
 
         // Step 5: Serialize the document to a string
         const serializer = new XMLSerializer();
@@ -1001,18 +1303,19 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
         let components = getBookComponents();
 
-        components.forEach(chapter =>{
+        components.forEach((chapter, idx) =>{
             // First navPoint
             const navPoint1 = doc.createElementNS('http://www.daisy.org/z3986/2005/ncx/', 'navPoint');
-            navPoint1.setAttribute('id', chapter.meta.id);
-            navPoint1.setAttribute('playOrder', '' + (1+chapter.index));
+            navPoint1.setAttribute('id', chapter.meta.id || ("nav-" + (idx + 1)));
+            const order = (chapter.index !== undefined) ? (1 + chapter.index) : (idx + 1);
+            navPoint1.setAttribute('playOrder', '' + order);
             navMap.appendChild(navPoint1);
 
             const navLabel1 = doc.createElementNS('http://www.daisy.org/z3986/2005/ncx/', 'navLabel');
             navPoint1.appendChild(navLabel1);
 
             const text1 = doc.createElementNS('http://www.daisy.org/z3986/2005/ncx/', 'text');
-            text1.textContent = BIF.map.title.main;
+            text1.textContent = (chapter.meta && chapter.meta.title) ? chapter.meta.title : BIF.map.title.main;
             navLabel1.appendChild(text1);
 
             const content1 = doc.createElementNS('http://www.daisy.org/z3986/2005/ncx/', 'content');
@@ -1029,6 +1332,39 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             name: "OEBPS/toc.ncx",
             input: `<?xml version="1.0" encoding="utf-8" standalone="no"?>\n` + xmlString
         });
+
+        if (detectFixedLayout(files).isFixedLayout) {
+            const escapeXmlText = value => String(value).replace(/[&<>]/g, ch => ({
+                "&": "&amp;",
+                "<": "&lt;",
+                ">": "&gt;"
+            })[ch]);
+            const escapeXmlAttribute = value => escapeXmlText(value).replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+            let navOl = '';
+            components.forEach(chapter => {
+                const path = truncate(chapter.meta.path);
+                const label = chapter.meta.title || BIF.map.title.main;
+                navOl += `        <li><a href="${escapeXmlAttribute(path)}">${escapeXmlText(label)}</a></li>\n`;
+            });
+            const navDoc = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head>
+    <title>${escapeXmlText(BIF.map.title.main)}</title>
+</head>
+<body>
+    <nav epub:type="toc" id="toc">
+        <h1>Table of Contents</h1>
+        <ol>
+${navOl}        </ol>
+    </nav>
+</body>
+</html>`;
+            files.push({
+                name: "OEBPS/nav.xhtml",
+                input: navDoc
+            });
+        }
     }
     async function downloadEPUB(){
         let imageAssets = new Array();
@@ -1052,15 +1388,22 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         `
         });
 
-        // Add required encryption file for DRM compliance (required by EPUB spec)
-        files.push({
-            name: "META-INF/encryption.xml",
-            input: `<?xml version="1.0" encoding="UTF-8"?>
-                <encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"/>
-        `
-        });
-
         await createContent(files, imageAssets);
+
+        const isFixedLayout = detectFixedLayout(files).isFixedLayout;
+        if (isFixedLayout) {
+            files.push({
+                name: "META-INF/com.apple.ibooks.display-options.xml",
+                input: `<?xml version="1.0" encoding="UTF-8"?>
+<display_options>
+    <platform name="*">
+        <option name="fixed-layout">true</option>
+        <option name="specified-fonts">true</option>
+    </platform>
+</display_options>
+`
+            });
+        }
 
         makePackage(files, imageAssets);
         makeToc(files);
@@ -1118,43 +1461,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         s.innerHTML = CSS;
         document.head.appendChild(s)
 
-        if (!window.__bif_cfc1){
-            alert("Injection failed! __bif_cfc1 not found");
-            return;
-        }
-
-        // Debug: Log the original function structure
-        console.log("Original __bif_cfc1:", window.__bif_cfc1);
-        console.log("__bif_cfc1.__boundArgs:", window.__bif_cfc1.__boundArgs);
-        const old_crf1 = window.__bif_cfc1;
-        window.__bif_cfc1 = (win, edata)=>{
-            // If the bind hook succeeds, then the first element of bound args
-            // will be the decryption function. So we just passivly build up an
-            // index of the pages!
-            if (old_crf1.__boundArgs && old_crf1.__boundArgs[0]) {
-                pages[win.name] = old_crf1.__boundArgs[0](edata);
-            } else {
-                console.warn("Bind args not found, trying alternative decryption method");
-                // Try global decryption function if available
-                if (window.__libregrab_decryption_fn) {
-                    try {
-                        pages[win.name] = window.__libregrab_decryption_fn(edata);
-                    } catch (error) {
-                        console.error("Global decryption function failed:", error);
-                    }
-                }
-                // Final fallback: try to extract decrypted content directly
-                try {
-                    pages[win.name] = old_crf1(win, edata);
-                } catch (error) {
-                    console.error("Failed to decrypt content:", error);
-                    console.log("Attempting raw edata extraction");
-                    pages[win.name] = edata; // Sometimes the edata is already decrypted
-                }
-            }
-            return old_crf1(win, edata);
-        };
-
         buildBookPirateUi();
     }
 
@@ -1166,7 +1472,15 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting download</b><br>";
 
-        downloadEPUB().then(()=>{});
+        downloadEPUB().catch(error=>{
+            console.error("EPUB export failed", error);
+            const errorElem = document.createElement("div");
+            errorElem.innerHTML = "<b>EPUB export failed:</b> ";
+            errorElem.appendChild(document.createTextNode(error && error.message ? error.message : String(error)));
+            downloadElem.appendChild(errorElem);
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            downloadState = -1;
+        });
     }
     function buildBookPirateUi(){
         // Create the nav
@@ -1202,10 +1516,16 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         if (window.BIF != undefined && document.querySelector(".nav-progress-bar") != undefined){
             clearInterval(intr);
             BIF = window.BIF;
-            let mode = location.hostname.split(".")[1];
+            const hostParts = location.hostname.split(".");
+            let mode = null;
+            if (hostParts.includes("listen") || (window.BIF && window.BIF.objects && window.BIF.objects.spool)) {
+                mode = "listen";
+            } else if (hostParts.includes("read") || (window.BIF && window.BIF.objects && window.BIF.objects.reader)) {
+                mode = "read";
+            }
             if (mode == "listen"){
                 bifFoundAudiobook();
-            }else if (mode == "read"){
+            } else if (mode == "read"){
                 bifFoundBook();
             }
         }
