@@ -866,7 +866,15 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         const doc = parser.parseFromString(htmlString, 'text/html');
         const bod = doc.querySelector("body");
         if (bod){
-            bod.setAttribute("id", metaId);
+            const usedIds = new Set(Array.from(doc.querySelectorAll("[id]"))
+                .filter(el => el !== bod)
+                .map(el => el.getAttribute("id")));
+            let bodyId = metaId;
+            let suffix = 1;
+            while (usedIds.has(bodyId)) {
+                bodyId = `${metaId}-body-${suffix++}`;
+            }
+            bod.setAttribute("id", bodyId);
         }
 
         // Remove <base> tags: EPUB forbids them and they break relative resource paths
@@ -1041,7 +1049,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         // Language
         if (BIF.map.language){
             const dcLanguage = doc.createElementNS('http://purl.org/dc/elements/1.1/', 'dc:language');
-            dcLanguage.setAttribute('xsi:type', 'dcterms:RFC4646');
             let lang = Array.isArray(BIF.map.language) ? BIF.map.language[0] : (BIF.map.language || "en");
             dcLanguage.textContent = lang;
             packageElement.setAttribute('xml:lang', lang);
@@ -1158,6 +1165,11 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             idStore.push(id);
             item.setAttribute('href', truncate(chapter.meta.path));
             item.setAttribute('media-type', 'application/xhtml+xml');
+            const chapterFile = files.find(f => f.name === "OEBPS/" + truncate(chapter.meta.path));
+            if (isFixedLayout && chapterFile && typeof chapterFile.input === "string" &&
+                /<(?:[A-Za-z_][\w.-]*:)?svg(?:\s|>)/i.test(chapterFile.input)) {
+                item.setAttribute('properties', 'svg');
+            }
             manifest.appendChild(item);
 
 
@@ -1353,14 +1365,6 @@ ${navOl}        </ol>
                         <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
                     </rootfiles>
                 </container>
-        `
-        });
-
-        // Add required encryption file for DRM compliance (required by EPUB spec)
-        files.push({
-            name: "META-INF/encryption.xml",
-            input: `<?xml version="1.0" encoding="UTF-8"?>
-                <encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"/>
         `
         });
 
