@@ -1023,10 +1023,26 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
         const { isFixedLayout, originalResolution } = detectFixedLayout(files);
 
+        // EPUB 2 content documents use the XHTML 1.1 vocabulary. The source
+        // reader adds data-* annotations that are useful in its own DOM but
+        // are not valid XHTML 1.1, and XMLSerializer omits the XHTML doctype.
+        if (!isFixedLayout) {
+            const xhtml11Doctype = '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">';
+            for (const file of files) {
+                if (!/\.(xhtml|html)$/i.test(file.name) || typeof file.input !== 'string') continue;
+                file.input = file.input.replace(/\sdata-[\w:.-]+=(?:"[^"]*"|'[^']*')/gi, '');
+                if (/<!doctype\s+html[^>]*>/i.test(file.input)) {
+                    file.input = file.input.replace(/<!doctype\s+html[^>]*>/i, xhtml11Doctype);
+                } else {
+                    file.input = file.input.replace(/^(<\?xml[^?]*\?>)/i, `$1\n${xhtml11Doctype}`);
+                }
+            }
+        }
+
         // Step 2: Set attributes for the root element
         const packageElement = doc.documentElement;
         packageElement.setAttribute('version', isFixedLayout ? '3.0' : '2.0');
-        packageElement.setAttribute('xml:lang', 'en');
+        if (isFixedLayout) packageElement.setAttribute('xml:lang', 'en');
         packageElement.setAttribute('unique-identifier', 'pub-identifier');
         packageElement.setAttribute('xmlns', 'http://www.idpf.org/2007/opf');
         packageElement.setAttribute('xmlns:dc', 'http://purl.org/dc/elements/1.1/');
@@ -1051,16 +1067,18 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             const dcLanguage = doc.createElementNS('http://purl.org/dc/elements/1.1/', 'dc:language');
             let lang = Array.isArray(BIF.map.language) ? BIF.map.language[0] : (BIF.map.language || "en");
             dcLanguage.textContent = lang;
-            packageElement.setAttribute('xml:lang', lang);
+            if (isFixedLayout) packageElement.setAttribute('xml:lang', lang);
             metadata.appendChild(dcLanguage);
         }
 
         // Identifier
-        const metaIdentifier = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
-        metaIdentifier.setAttribute('id', 'meta-identifier');
-        metaIdentifier.setAttribute('property', 'dcterms:identifier');
-        metaIdentifier.textContent = "" + BIF.map["-odread-buid"];
-        metadata.appendChild(metaIdentifier);
+        if (isFixedLayout) {
+            const metaIdentifier = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            metaIdentifier.setAttribute('id', 'meta-identifier');
+            metaIdentifier.setAttribute('property', 'dcterms:identifier');
+            metaIdentifier.textContent = "" + BIF.map["-odread-buid"];
+            metadata.appendChild(metaIdentifier);
+        }
 
         // Title
         const dcTitle = doc.createElementNS('http://purl.org/dc/elements/1.1/', 'dc:title');
