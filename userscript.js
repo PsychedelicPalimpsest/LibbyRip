@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-06-01
+// @version       2026-10-31
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -31,6 +31,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 });
 `;
     function mainCode() {
+    if (!/\.(listen|read)\./.test(location.hostname)) return;
 
     // Since the ffmpeg.js file is 50mb, it slows the page down too much
     // to be in a "require" attribute, so we load it in async
@@ -97,19 +98,35 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     */
 
 
-    // Libby, somewhere, gets the crypto stuff we need for mp3 urls, then removes it before adding it to the BIF.
-    // here, we simply hook json parse to get it for us!
-
-    const old_parse = JSON.parse;
+    // Do NOT replace JSON.parse: OverDrive's 2026 listen player integrity-checks
+    // it and navigates to /policies/terms-and-conditions. Capture signed MP3
+    // URLs from the player's own resource requests instead (and keep any
+    // -odread-cmpt-params we happen to see on XHR/fetch bodies, without
+    // wrapping JSON.parse).
     let odreadCmptParams = null;
-    JSON.parse = function(...args){
-        let ret = old_parse(...args);
-        if (typeof(ret) == "object" && ret["b"] != undefined && ret["b"]["-odread-cmpt-params"] != undefined){
-            odreadCmptParams = Array.from(ret["b"]["-odread-cmpt-params"]);
-        }
+    const capturedPlayerUrls = new Map();
 
-        return ret;
+    function partKeyFromUrl(u){
+        try { return decodeURIComponent(new URL(u, location.href).pathname.split("/").pop()); }
+        catch (e) { return null; }
     }
+    function recordPlayerUrl(u){
+        try {
+            if (typeof u !== "string" || u.indexOf(".mp3") === -1) return;
+            const key = partKeyFromUrl(u);
+            if (key && !capturedPlayerUrls.has(key)) capturedPlayerUrls.set(key, u);
+        } catch (e) {}
+    }
+    function mergePerformanceMediaUrls(){
+        try {
+            const entries = performance.getEntriesByType("resource") || [];
+            for (let i = 0; i < entries.length; i++) {
+                if (entries[i] && entries[i].name) recordPlayerUrl(entries[i].name);
+            }
+        } catch (e) {}
+    }
+    // Intentionally no fetch/XHR/JSON.parse prototype hooks — those are
+    // integrity-checked by the 2026 listen player.
 
 
 
@@ -150,11 +167,21 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         document.body.appendChild(downloadElem);
     }
     function getUrls(){
+        mergePerformanceMediaUrls();
         let ret = [];
         for (let spine of BIF.objects.spool.components){
+            let partFile = spine.meta.path;
+            try { partFile = decodeURIComponent(spine.meta.path); } catch (e) {}
+            partFile = String(partFile).split("/").pop();
+            let captured = capturedPlayerUrls.get(partFile);
+            if (!captured) {
+                capturedPlayerUrls.forEach(function(v, k){
+                    if (!captured && k && partFile && (k === partFile || k.endsWith(partFile) || partFile.endsWith(k))) captured = v;
+                });
+            }
+            const qp = (odreadCmptParams || [])[spine.spinePosition];
             let data = {
-
-                url: location.origin + "/" + spine.meta.path + "?" + odreadCmptParams[spine.spinePosition],
+                url: captured || (location.origin + "/" + spine.meta.path + (qp ? "?" + qp : "")),
                 index : spine.meta["-odread-spine-position"],
                 duration: spine.meta["audio-duration"],
                 size: spine.meta["-odread-file-bytes"],
@@ -163,6 +190,35 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             ret.push(data);
         }
         return ret;
+    }
+    function urlLooksSigned(u){
+        return !!(u && u.url && (u.url.indexOf("cmpt=") !== -1 || /[?&][^=]+=/.test(u.url)));
+    }
+    async function ensurePlayerUrls(){
+        mergePerformanceMediaUrls();
+        let urls = getUrls();
+        if (urls.every(urlLooksSigned)) return urls;
+        const spool = BIF.objects && BIF.objects.spool;
+        const comps = spool && spool.components;
+        if (!spool || !comps || typeof spool.seek !== "function") return getUrls();
+        // Currently-loaded part 0 will not re-request; seek elsewhere first.
+        if (comps.length > 1) {
+            try { spool.seek(comps[comps.length - 1], 1200); } catch (e) {}
+            await new Promise(function(r){ setTimeout(r, 1200); });
+            mergePerformanceMediaUrls();
+        }
+        for (let i = 0; i < comps.length; i++) {
+            urls = getUrls();
+            if (urlLooksSigned(urls[i])) continue;
+            try { spool.seek(comps[i], 1200); } catch (e) {}
+            const t0 = Date.now();
+            while (Date.now() - t0 < 8000) {
+                await new Promise(function(r){ setTimeout(r, 200); });
+                mergePerformanceMediaUrls();
+                if (urlLooksSigned(getUrls()[i])) break;
+            }
+        }
+        return getUrls();
     }
     function paddy(num, padlen, padchar) {
         var pad_char = typeof padchar !== 'undefined' ? padchar : '0';
@@ -200,7 +256,8 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
             chapterMenuElem.querySelector("#dumpAll").style.display = "none";
 
-            await Promise.all(getUrls().map(async function(url){
+            const urls = await ensurePlayerUrls();
+            await Promise.all(urls.map(async function(url){
                 const res = await fetch(url.url);
                 const blob = await res.blob();
 
@@ -433,14 +490,20 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         return ffmpegInitPromise;
     }
 
-    function exportMP3(){
+    async function exportMP3(){
         if (downloadState != -1)
             return;
 
         downloadState = 0;
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting MP3</b><br>";
-        createAndDownloadMp3(getUrls()).then((p)=>{});
+        const urls = await ensurePlayerUrls();
+        if (!urls.every(urlLooksSigned)) {
+            downloadElem.innerHTML += "Could not capture every part URL. Try playing/seeking once, then export again.<br>";
+            downloadState = -1;
+            return;
+        }
+        createAndDownloadMp3(urls).then((p)=>{});
     }
 
 
@@ -548,14 +611,20 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.classList.remove("active");
     }
 
-    function exportChapters(){
+    async function exportChapters(){
         if (downloadState != -1)
             return;
 
         downloadState = 0;
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting export</b><br>";
-        createAndDownloadZip(getUrls(), true).then((p)=>{});
+        const urls = await ensurePlayerUrls();
+        if (!urls.every(urlLooksSigned)) {
+            downloadElem.innerHTML += "Could not capture every part URL. Try playing/seeking once, then export again.<br>";
+            downloadState = -1;
+            return;
+        }
+        createAndDownloadZip(urls, true).then((p)=>{});
     }
 
     // Main entry point for audiobooks
@@ -564,11 +633,8 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let s = document.createElement("style");
         s.innerHTML = CSS;
         document.head.appendChild(s)
-        if (odreadCmptParams == null){
-            alert("odreadCmptParams not set, so cannot resolve book urls! Please try refreshing.")
-            return;
-        }
-
+        mergePerformanceMediaUrls();
+        // UI no longer depends on -odread-cmpt-params; export captures player URLs.
         buildPirateUi();
         initFFmpeg().catch(console.error);
     }
@@ -591,29 +657,26 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     `;
     const pages = window.pages = {};
 
-    // Libby used the bind method as a way to "safely" expose
-    // the decryption module. THIS IS THEIR DOWNFALL.
-    // As we can hook bind, allowing us to obtain the
-    // decryption function
-    const originalBind = Function.prototype.bind;
-    Function.prototype.bind = function(...args) {
-        const boundFn = originalBind.apply(this, args);
-
-        // Store bound arguments (excluding `this`) for potential decryption function
-        boundFn.__boundArgs = args.slice(1);
-
-        // Also store the original function for debugging
-        boundFn.__originalFunction = this;
-
-        // If this looks like a decryption function, store it globally
-        if (this.toString().includes('decryption') ||
-            args.some(arg => typeof arg === 'function' && arg.toString().includes('decryption'))) {
-            console.log("Decryption function detected:", this);
-            window.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
-        }
-
-        return boundFn;
-    };
+    // Libby used bind to expose the ebook decryption module. Do not install
+    // this hook on listen.* — wrapping Function.prototype.bind also trips
+    // OverDrive's 2026 player integrity check (terms-and-conditions bounce).
+    // Guard toString: native/exotic functions throw and would crash bind().
+    if (/\.read\./.test(location.hostname)) {
+        const originalBind = Function.prototype.bind;
+        Function.prototype.bind = function(...args) {
+            const boundFn = originalBind.apply(this, args);
+            try {
+                boundFn.__boundArgs = args.slice(1);
+                boundFn.__originalFunction = this;
+                const src = Function.prototype.toString.call(this);
+                if (src.includes('decryption') ||
+                    args.some(arg => typeof arg === 'function' && Function.prototype.toString.call(arg).includes('decryption'))) {
+                    window.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
+                }
+            } catch (e) {}
+            return boundFn;
+        };
+    }
 
 
     async function waitForChapters(callback){
