@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-10-31
+// @version       2026-11-01
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -25,7 +25,7 @@
 
 (function () {
     function mainCode() {
-    const EXPORT_VERSION = '2026-10-31';
+    const EXPORT_VERSION = '2026-11-01';
 
     // Since the ffmpeg.js file is 50mb, it slows the page down too much
     // to be in a "require" attribute, so we load it in async
@@ -34,7 +34,7 @@
         return new Promise((resolve, reject) => {
             const tag = document.createElement('script');
             tag.src = 'https://github.com/PsychedelicPalimpsest/FFmpeg-js/releases/download/14/0.12.5.bundle.js';
-            const timer = setTimeout(() => finish(new Error('FFmpeg 下载超时，请检查网络后重试。')), 120000);
+            const timer = setTimeout(() => finish(new Error('FFmpeg download timed out. Check your connection and try again.')), 120000);
             function finish(error) {
                 clearTimeout(timer);
                 tag.onload = tag.onerror = null;
@@ -42,8 +42,8 @@
                 if (error) reject(error);
                 else resolve(window.createFFmpeg);
             }
-            tag.onerror = () => finish(new Error('无法加载 FFmpeg，浏览器可能阻止了脚本或网络请求。'));
-            tag.onload = () => finish(typeof window.createFFmpeg === 'function' ? null : new Error('FFmpeg 脚本未提供 createFFmpeg。'));
+            tag.onerror = () => finish(new Error('Could not load FFmpeg. The browser may have blocked the script or network request.'));
+            tag.onload = () => finish(typeof window.createFFmpeg === 'function' ? null : new Error('The FFmpeg script did not provide createFFmpeg.'));
             (document.head || document.documentElement).appendChild(tag);
         });
     }
@@ -59,7 +59,7 @@
             const controller = new AbortController();
             const timer = setTimeout(() => {
                 controller.abort();
-                finish(new Error('ZIP 库加载超时，请检查网络后重试。'));
+                finish(new Error('ZIP library loading timed out. Check your connection and try again.'));
             }, 45000);
             let settled = false;
             function finish(error, writer) {
@@ -71,12 +71,12 @@
                 else resolve(writer);
             }
             window.__libregrabZipReadyV2 = writer => {
-                if (typeof writer !== 'function') return finish(new Error('ZIP 库未正确初始化。'));
+                if (typeof writer !== 'function') return finish(new Error('The ZIP library did not initialize correctly.'));
                 finish(null, writer);
             };
             fetch('https://unpkg.com/client-zip@2.5.0/worker.js', { signal: controller.signal })
                 .then(response => {
-                    if (!response.ok) throw new Error('ZIP 库下载失败：HTTP ' + response.status);
+                    if (!response.ok) throw new Error('ZIP library download failed: HTTP ' + response.status);
                     return response.text();
                 })
                 .then(code => {
@@ -184,13 +184,15 @@
 
 
     const audioBookNav = `
-        <a class="pLink" id="chap"> <h1> View chapters </h1> </a>
+        <a class="pLink" id="chap"> <h1> View audio parts </h1> </a>
         <a class="pLink" id="down"> <h1> Export as MP3 </h1> </a>
-        <a class="pLink" id="exp"> <h1> Export audiobook </h1> </a>
+        <a class="pLink" id="exp"> <h1> Export audiobook · Chapter ZIP </h1> </a>
     `;
     const chaptersMenu = `
-        <h2>This book contains {CHAPTERS} chapters.</h2>
-        <button class="shibui-button" style="background-color: white" id="dumpAll"> Download all </button><br>
+        <h2>Original audio files: {CHAPTERS}</h2>
+        <p>To split audio using chapter metadata, click Export audiobook · Chapter ZIP.</p>
+        <button class="shibui-button" style="background-color: white" id="dumpAll"> Download all </button>
+        <button class="shibui-button" style="background-color: white" id="originalZip"> Original files ZIP </button><br>
     `;
     let chapterMenuElem;
     let libreShadowHost = null;
@@ -202,7 +204,7 @@
         nav.innerHTML = audioBookNav;
         nav.querySelector("#chap").onclick = viewChapters;
         nav.querySelector("#down").onclick = exportMP3;
-        nav.querySelector("#exp").onclick = exportChapters;
+        nav.querySelector("#exp").onclick = exportChapterAudio;
         nav.classList.add("pNav");
         let pbar = document.querySelector(".nav-progress-bar");
         pbar.insertBefore(libreShadowHost, pbar.children[1]);
@@ -215,6 +217,7 @@
         const urls = getUrls();
 
         chapterMenuElem.innerHTML = chaptersMenu.replace("{CHAPTERS}", urls.length);
+        chapterMenuElem.querySelector('#originalZip').onclick = exportChapters;
         libreShadowRoot.appendChild(chapterMenuElem);
 
         downloadElem = document.createElement("div");
@@ -232,6 +235,7 @@
 
                 url: captured || location.origin + "/" + spine.meta.path + "?" + (odreadCmptParams || [])[spine.spinePosition],
                 index : spine.meta["-odread-spine-position"],
+                spinePosition: spine.spinePosition,
                 // File numbering follows list order, independently of player metadata.
                 fileNumber: ret.length + 1,
                 duration: spine.meta["audio-duration"],
@@ -242,26 +246,73 @@
         }
         return ret;
     }
+    function getSafeBookTitle(maxLength) {
+        let title = String(BIF.map.title?.main || 'Audiobook')
+            .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+            .trim().replace(/[. ]+$/g, '') || 'Audiobook';
+        if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(title)) title = '_' + title;
+        // Leave room for the suffix and extension without splitting Unicode pairs.
+        let safeTitle = '';
+        for (const character of title) {
+            if (safeTitle.length + character.length > maxLength) break;
+            safeTitle += character;
+        }
+        return safeTitle.replace(/[. ]+$/g, '');
+    }
     function getAudioPartFilename(part, totalParts) {
         // padStart keeps large numbers intact; all files use the same width.
         const width = Math.max(3, String(totalParts).length);
         const number = String(part.fileNumber).padStart(width, '0');
-        const title = [getAuthorString(), BIF.map.title.main].filter(Boolean).join(' - ')
-            .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
-            .trim().replace(/[. ]+$/g, '') || 'Audiobook';
-        // Leave room for the prefix and extension without splitting Unicode pairs.
-        const titleLimit = 240 - number.length - ' - '.length - '.mp3'.length;
-        let safeTitle = '';
-        for (const character of title) {
-            if (safeTitle.length + character.length > titleLimit) break;
-            safeTitle += character;
-        }
-        return `${number} - ${safeTitle.replace(/[. ]+$/g, '')}.mp3`;
+        const suffix = ` - ${number}.mp3`;
+        return getSafeBookTitle(240 - suffix.length) + suffix;
     }
     function getBookOutputFilename(extension) {
-        let base = getAudioPartFilename({ fileNumber: 1 }, 1).slice(6, -4);
-        if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(base)) base = '_' + base;
-        return base + '.' + extension;
+        const suffix = '.' + extension;
+        return getSafeBookTitle(240 - suffix.length) + suffix;
+    }
+    function getChapterFilename(chapter, totalChapters, bookTitle) {
+        function clean(value, fallback) {
+            let text = String(value || fallback).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+                .trim().replace(/[. ]+$/g, '') || fallback;
+            if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(text)) text = '_' + text;
+            return text;
+        }
+        function truncate(text, limit) {
+            let result = '';
+            for (const character of text) {
+                if (result.length + character.length > limit) break;
+                result += character;
+            }
+            return result.replace(/[. ]+$/g, '');
+        }
+        const number = String(chapter.number).padStart(Math.max(3, String(totalChapters).length), '0');
+        const separator = ` - ${number} - `;
+        const title = truncate(clean(bookTitle, 'Audiobook'), 140);
+        const chapterTitle = truncate(clean(chapter.title, 'Chapter'), 240 - title.length - separator.length - '.mp3'.length);
+        return title + separator + chapterTitle + '.mp3';
+    }
+    function orderChapterSourceUrls(urls, metadata) {
+        if (urls.length !== metadata.spine.length) {
+            throw new Error(`The audio file count does not match metadata.spine (${urls.length}/${metadata.spine.length}). Cannot split chapters reliably.`);
+        }
+        const ordered = new Array(metadata.spine.length);
+        function position(value) {
+            if (value === null || value === undefined || (typeof value === 'string' && !value.trim())) return null;
+            if (typeof value !== 'number' && typeof value !== 'string') return null;
+            const number = Number(value);
+            return Number.isInteger(number) && number >= 0 && number < ordered.length ? number : null;
+        }
+        for (const url of urls) {
+            const index = position(url.index);
+            const fallback = position(url.spinePosition);
+            if (index !== null && fallback !== null && index !== fallback) {
+                throw new Error('The audio file ordering fields disagree. Cannot reliably match metadata.spine.');
+            }
+            const selected = index !== null ? index : fallback;
+            if (selected === null || ordered[selected]) throw new Error('An audio file spine index is missing or duplicated. Cannot split chapters reliably.');
+            ordered[selected] = url;
+        }
+        return ordered;
     }
     function appendExportMessage(message) {
         const line = document.createElement('div');
@@ -290,7 +341,7 @@
         } catch (error) {
             if (error.name === 'AbortError') throw error;
             if (error.name !== 'SecurityError') throw error;
-            appendExportMessage('当前页面不允许打开保存对话框，生成后将显示手动保存链接。');
+            appendExportMessage('This page cannot open the save dialog. A manual save link will appear when the file is ready.');
             return null;
         }
     }
@@ -304,11 +355,11 @@
                 writable = await handle.createWritable();
                 await writable.write(file);
                 await writable.close();
-                appendExportMessage('已保存：' + handle.name);
+                appendExportMessage('Saved: ' + handle.name);
                 return;
             } catch (error) {
                 if (writable) { try { await writable.abort(); } catch (_) {} }
-                appendExportMessage('写入所选文件失败：' + error.message + '。可用下方链接重试保存。');
+                appendExportMessage('Could not write to the selected file: ' + error.message + '. Use the link below to save it again.');
             }
         }
         if (lastExportObjectUrl) URL.revokeObjectURL(lastExportObjectUrl);
@@ -318,9 +369,9 @@
         link.download = filename;
         link.className = 'pLink';
         link.style.display = 'block';
-        link.textContent = '点击保存：' + filename;
+        link.textContent = 'Click to save: ' + filename;
         downloadElem.appendChild(link);
-        appendExportMessage('文件已生成，尚待保存。请点击上面的链接；链接会保留到下一次导出。');
+        appendExportMessage('The file is ready but has not been saved. Click the link above; it remains available until the next export.');
     }
     async function verifyZipFileNames(blob, expectedNames) {
         // Read the actual central directory, independently of the writer API.
@@ -333,36 +384,36 @@
                 break;
             }
         }
-        if (end < 0) throw new Error('ZIP 不完整：未找到目录结尾。');
+        if (end < 0) throw new Error('Incomplete ZIP: the end of the central directory was not found.');
         let count = tail.getUint16(end + 10, true);
         let size = tail.getUint32(end + 12, true);
         let offset = tail.getUint32(end + 16, true);
         if (count === 0xffff || size === 0xffffffff || offset === 0xffffffff) {
             const locatorAt = tailStart + end - 20;
             const locator = new DataView(await blob.slice(locatorAt, locatorAt + 20).arrayBuffer());
-            if (locator.byteLength !== 20 || locator.getUint32(0, true) !== 0x07064b50) throw new Error('ZIP64 目录无效。');
+            if (locator.byteLength !== 20 || locator.getUint32(0, true) !== 0x07064b50) throw new Error('Invalid ZIP64 directory locator.');
             const zip64Offset = Number(locator.getBigUint64(8, true));
-            if (!Number.isSafeInteger(zip64Offset)) throw new Error('ZIP64 目录位置过大。');
+            if (!Number.isSafeInteger(zip64Offset)) throw new Error('The ZIP64 directory offset is too large.');
             const zip64 = new DataView(await blob.slice(zip64Offset, zip64Offset + 56).arrayBuffer());
-            if (zip64.byteLength !== 56 || zip64.getUint32(0, true) !== 0x06064b50) throw new Error('ZIP64 目录结尾无效。');
+            if (zip64.byteLength !== 56 || zip64.getUint32(0, true) !== 0x06064b50) throw new Error('Invalid ZIP64 end of central directory.');
             count = Number(zip64.getBigUint64(32, true));
             size = Number(zip64.getBigUint64(40, true));
             offset = Number(zip64.getBigUint64(48, true));
         }
         if (count !== expectedNames.length || !Number.isSafeInteger(size) || !Number.isSafeInteger(offset) || offset + size > blob.size) {
-            throw new Error('ZIP 文件数量或目录位置与预期不符。');
+            throw new Error('The ZIP entry count or central directory offset does not match the export plan.');
         }
         const bytes = new Uint8Array(await blob.slice(offset, offset + size).arrayBuffer());
         const directory = new DataView(bytes.buffer);
         const decoder = new TextDecoder('utf-8', { fatal: true });
         let at = 0;
         for (const expected of expectedNames) {
-            if (at + 46 > bytes.length || directory.getUint32(at, true) !== 0x02014b50) throw new Error('ZIP 文件目录损坏。');
+            if (at + 46 > bytes.length || directory.getUint32(at, true) !== 0x02014b50) throw new Error('The ZIP central directory is corrupt.');
             const nameLength = directory.getUint16(at + 28, true);
             const next = at + 46 + nameLength + directory.getUint16(at + 30, true) + directory.getUint16(at + 32, true);
-            if (next > bytes.length) throw new Error('ZIP 文件目录被截断。');
+            if (next > bytes.length) throw new Error('The ZIP central directory is truncated.');
             const actual = decoder.decode(bytes.subarray(at + 46, at + 46 + nameLength));
-            if (actual !== expected) throw new Error(`ZIP 文件名校验失败：预期 ${expected}，实际 ${actual}`);
+            if (actual !== expected) throw new Error(`ZIP filename verification failed: expected ${expected}, got ${actual}`);
             at = next;
         }
     }
@@ -487,8 +538,7 @@
 
     }
 
-    async function createMetadata(){
-        let metadata = getMetadata();
+    async function createMetadata(metadata = getMetadata()){
         const files = [{
                 name: "metadata/metadata.json",
                 input: JSON.stringify(metadata, null, 2)
@@ -502,7 +552,7 @@
                 const extension = extensions[blob.type.split(';')[0]];
                 if (extension) files.unshift({ name: 'metadata/cover.' + extension, input: blob });
             } catch (error) {
-                appendExportMessage('封面未能下载，继续导出音频：' + error.message);
+                appendExportMessage('Could not download the cover. Continuing with the audio export: ' + error.message);
             }
         }
         return files;
@@ -609,9 +659,14 @@
         });
     }
 
-    async function fetchMp3ExportBlob(url, label, timeoutMs = 120000) {
+    async function fetchMp3ExportBlob(url, label, timeoutMs = 120000, externalSignal = null) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const onAbort = () => controller.abort(externalSignal.reason);
+        if (externalSignal) {
+            if (externalSignal.aborted) onAbort();
+            else externalSignal.addEventListener('abort', onAbort, { once: true });
+        }
         try {
             const response = await fetch(url, { signal: controller.signal });
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -619,9 +674,11 @@
             if (!blob.size) throw new Error('the response was empty');
             return blob;
         } catch (error) {
+            if (externalSignal?.aborted) throw new Error(`${label}: export cancelled`);
             throw new Error(`${label}: ${controller.signal.aborted ? 'download timed out' : error.message}`);
         } finally {
             clearTimeout(timer);
+            if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
         }
     }
 
@@ -865,23 +922,23 @@
         if (downloadState != -1)
             return;
         downloadState = 0;
-        let stage = '选择保存位置';
+        let stage = 'Choose save location';
         try {
-            startExport('合并 MP3');
+            startExport('Merge MP3');
             const filename = getBookOutputFilename('mp3');
             const handle = await chooseExportHandle(filename, 'mp3');
-            stage = '准备音频';
+            stage = 'Prepare audio';
             const urls = await ensurePlayerUrls(getUrls());
             const bad = urls.filter(url => !hasWorkingUrl(url));
             if (bad.length) {
-                throw new Error('无法获取第 ' + bad.map(url => url.fileNumber).join(', ') + ' 部分的音频地址，请先播放这些部分后重试。');
+                throw new Error('Could not get audio URLs for parts ' + bad.map(url => url.fileNumber).join(', ') + '. Play these parts first, then try again.');
             }
-            stage = '合并 MP3';
+            stage = 'Merge MP3';
             await createAndDownloadMp3(urls, handle, filename);
         } catch (error) {
             console.error('[LibreGRAB ' + EXPORT_VERSION + '] MP3 export failed', error);
-            appendExportMessage(error.name === 'AbortError' && stage === '选择保存位置'
-                ? '已取消保存。' : stage + '失败：' + error.message);
+            appendExportMessage(error.name === 'AbortError' && stage === 'Choose save location'
+                ? 'Save cancelled.' : stage + ' failed: ' + error.message);
         } finally {
             downloadState = -1;
         }
@@ -913,7 +970,7 @@
 
     async function createAndDownloadZip(urls, addMeta, saveHandle, outputFilename) {
         const files = [];
-        if (!urls.length) throw new Error('没有可导出的音频。');
+        if (!urls.length) throw new Error('No audio is available to export.');
         // Assign names at the final archive boundary, never from URLs or headers.
         // Sequential fetching also avoids other downloads continuing after failure.
         for (const [index, url] of urls.entries()) {
@@ -921,9 +978,9 @@
             const response = await fetch(url.url);
             if (!response.ok) throw new Error(`${filename}: HTTP ${response.status}`);
             const blob = await response.blob();
-            if (!blob.size) throw new Error(filename + ' 是空文件。');
+            if (!blob.size) throw new Error(filename + ' is empty.');
             files.push({ name: filename, input: new File([blob], filename, { type: 'audio/mpeg' }) });
-            appendExportMessage(`已下载 ${index + 1}/${urls.length}：${filename}`);
+            appendExportMessage(`Downloaded ${index + 1}/${urls.length}: ${filename}`);
         }
         files.push({
             name: 'LibreGRAB-v2-files.txt',
@@ -932,7 +989,7 @@
         if (addMeta) files.push(...await createMetadata());
         const expectedNames = files.map(file => file.name);
         const writer = await getDownloadZip();
-        appendExportMessage('正在生成 ZIP，并核对压缩包内的实际文件名……');
+        appendExportMessage('Creating the ZIP and verifying the filenames stored in the archive...');
         if (saveHandle) {
             let writable;
             try {
@@ -941,18 +998,18 @@
                 await zipStream.pipeTo(writable);
             } catch (error) {
                 if (writable) { try { await writable.abort(); } catch (_) {} }
-                appendExportMessage('直接写入 ZIP 失败：' + error.message + '。正在准备手动保存链接。');
+                appendExportMessage('Could not write the ZIP directly: ' + error.message + '. Preparing a manual save link.');
                 const blob = await writer(files).blob();
                 await verifyZipFileNames(blob, expectedNames);
                 await saveExportBlob(blob, outputFilename, null);
                 return;
             }
             await verifyZipFileNames(await saveHandle.getFile(), expectedNames);
-            appendExportMessage(`已保存 ${saveHandle.name}；已核对 ${urls.length} 个带序号的 MP3 文件。`);
+            appendExportMessage(`Saved ${saveHandle.name}; verified ${urls.length} numbered MP3 files.`);
         } else {
             const blob = await writer(files).blob();
             await verifyZipFileNames(blob, expectedNames);
-            appendExportMessage(`已核对 ${urls.length} 个带序号的 MP3 文件。`);
+            appendExportMessage(`Verified ${urls.length} numbered MP3 files.`);
             await saveExportBlob(blob, outputFilename, null);
         }
     }
@@ -961,24 +1018,505 @@
         if (downloadState != -1)
             return;
         downloadState = 0;
-        let stage = '选择保存位置';
+        let stage = 'Choose save location';
         try {
-            startExport('ZIP 导出');
+            startExport('Export ZIP');
             const filename = getBookOutputFilename('zip');
             const handle = await chooseExportHandle(filename, 'zip');
-            stage = '准备音频';
+            stage = 'Prepare audio';
             const urls = await ensurePlayerUrls(getUrls());
             const bad = urls.filter(url => !hasWorkingUrl(url));
             if (bad.length) {
-                throw new Error('无法获取第 ' + bad.map(url => url.fileNumber).join(', ') + ' 部分的音频地址，请先播放这些部分后重试。');
+                throw new Error('Could not get audio URLs for parts ' + bad.map(url => url.fileNumber).join(', ') + '. Play these parts first, then try again.');
             }
-            stage = '生成 ZIP';
+            stage = 'Create ZIP';
             await createAndDownloadZip(urls, true, handle, filename);
         } catch (error) {
             console.error('[LibreGRAB ' + EXPORT_VERSION + '] ZIP export failed', error);
-            appendExportMessage(error.name === 'AbortError' && stage === '选择保存位置'
-                ? '已取消保存。' : stage + '失败：' + error.message);
+            appendExportMessage(error.name === 'AbortError' && stage === 'Choose save location'
+                ? 'Save cancelled.' : stage + ' failed: ' + error.message);
         } finally {
+            downloadState = -1;
+        }
+    }
+
+function buildChapterPlan(metadata) {
+    const continuationTolerance = 0.001; // Seconds; only used to recognize continuation markers.
+    function numeric(value, label) {
+        if (typeof value === 'string') {
+            const text = value.trim();
+            if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(text)) {
+                throw new Error(label + ' must be a valid number and cannot be blank.');
+            }
+            value = Number(text);
+        }
+        if (typeof value !== 'number' || !Number.isFinite(value)) {
+            throw new Error(label + ' must be a finite number.');
+        }
+        return value;
+    }
+    if (!metadata || typeof metadata !== 'object' || !Array.isArray(metadata.spine) || !metadata.spine.length) {
+        throw new Error('Missing audio file list metadata.spine. Cannot split chapters.');
+    }
+    if (!Array.isArray(metadata.chapters) || !metadata.chapters.length) {
+        throw new Error('Missing chapter list metadata.chapters. Cannot split chapters.');
+    }
+
+    const spineDurations = [];
+    const spineStarts = [];
+    let duration = 0;
+    for (let index = 0; index < metadata.spine.length; index++) {
+        const length = numeric(metadata.spine[index]?.duration, `Duration of audio file ${index + 1}`);
+        if (length <= 0) throw new Error(`The duration of audio file ${index + 1} must be greater than 0.`);
+        const next = duration + length;
+        if (!Number.isFinite(next) || next <= duration) {
+            throw new Error(`The duration of audio file ${index + 1} cannot be added accurately to the timeline. Cannot split chapters reliably.`);
+        }
+        spineStarts.push(duration);
+        spineDurations.push(length);
+        duration = next;
+    }
+
+    const markers = [];
+    let previous = null;
+    for (let index = 0; index < metadata.chapters.length; index++) {
+        const entry = metadata.chapters[index];
+        const label = `Chapter entry ${index + 1}`;
+        if (!entry || typeof entry !== 'object' || typeof entry.title !== 'string' || !entry.title.trim()) {
+            throw new Error(label + ' is missing a valid title.');
+        }
+        const title = entry.title.trim();
+        const spine = numeric(entry.spine, label + ' spine');
+        if (!Number.isSafeInteger(spine) || spine < 0 || spine >= spineDurations.length) {
+            throw new Error(`${label} (${title}) has an out-of-range spine index: ${spine}.`);
+        }
+        const offset = numeric(entry.offset, label + ' offset');
+        if (offset < 0 || offset > spineDurations[spine]) {
+            throw new Error(`${label} (${title}) must have an offset between 0 and ${spineDurations[spine]} seconds.`);
+        }
+        const start = spineStarts[spine] + offset;
+        if (!Number.isFinite(start) || start >= duration) {
+            throw new Error(`${label} (${title}) starts at or beyond the end of the book and has no audio to export.`);
+        }
+        const current = { title, spine, offset, start };
+        if (previous && (spine < previous.spine || start < previous.start)) {
+            throw new Error(`${label} (${title}) moves backward in time. Check the chapter order, spine, and offset.`);
+        }
+        if (previous && start === previous.start && title !== previous.title) {
+            throw new Error(`${label} and the previous entry have different titles at ${start} seconds. Cannot determine the chapter boundary.`);
+        }
+        const continuation = previous && title === previous.title &&
+            spine === previous.spine + 1 && offset <= continuationTolerance;
+        if (!continuation) {
+            if (previous && start === previous.start) {
+                throw new Error(`${label} (${title}) is duplicated at ${start} seconds. Cannot create a nonempty chapter.`);
+            }
+            markers.push(current);
+        }
+        // Track the preceding source marker, including a merged continuation.
+        previous = current;
+    }
+
+    if (markers[0].start > 0) {
+        markers.unshift({ title: 'Opening', spine: 0, offset: 0, start: 0 });
+    }
+    const bookEnd = {
+        spine: spineDurations.length - 1,
+        offset: spineDurations[spineDurations.length - 1],
+        start: duration,
+    };
+    const chapters = markers.map((marker, index) => {
+        const next = markers[index + 1] || bookEnd;
+        if (next.start <= marker.start) {
+            throw new Error(`Chapter ${index + 1} (${marker.title}) has no valid duration.`);
+        }
+        const segments = [];
+        for (let spine = marker.spine; spine <= next.spine; spine++) {
+            // Keep exact source-local boundaries, rather than subtracting large global times.
+            const start = spine === marker.spine ? marker.offset : 0;
+            const end = spine === next.spine ? next.offset : spineDurations[spine];
+            if (end > start) segments.push({ spine, start, end });
+        }
+        if (!segments.length) throw new Error(`Chapter ${index + 1} (${marker.title}) has no audio segments to export.`);
+        return {
+            number: index + 1,
+            title: marker.title,
+            start: marker.start,
+            end: next.start,
+            duration: next.start - marker.start,
+            segments,
+        };
+    });
+    return { duration, chapters };
+}
+
+    async function* createChapterAudioEntries(urls, metadata, plan, signal) {
+        const inputCache = new Map();
+        const parts = metadata.spine;
+        const chapters = plan.chapters;
+        const offsets = [];
+        let position = 0;
+        for (const part of parts) {
+            offsets.push(position);
+            position += Number(part.duration);
+        }
+
+        function abortError() {
+            const error = new Error('Chapter export was cancelled.');
+            error.name = 'AbortError';
+            return error;
+        }
+        function checkCancelled() {
+            if (signal && signal.aborted) throw abortError();
+        }
+
+        // A batch contains complete chapters whose first audio part is the same.
+        // A chapter crossing a source boundary stays in one FFmpeg execution.
+        const batches = [];
+        for (const chapter of chapters) {
+            if (!Array.isArray(chapter.segments) || !chapter.segments.length) {
+                throw new Error(`Chapter ${chapter.number} has no source audio segments.`);
+            }
+            const firstSpine = chapter.segments[0].spine;
+            let batch = batches[batches.length - 1];
+            if (!batch || batch.firstSpine !== firstSpine) {
+                batch = { firstSpine, chapters: [], spines: new Set() };
+                batches.push(batch);
+            }
+            batch.chapters.push(chapter);
+            for (const segment of chapter.segments) {
+                if (!Number.isInteger(segment.spine) || segment.spine < 0 || segment.spine >= urls.length || !parts[segment.spine]) {
+                    throw new Error(`Chapter ${chapter.number} refers to an unavailable MP3 part.`);
+                }
+                batch.spines.add(segment.spine);
+            }
+        }
+
+        const lastBatchUse = new Map();
+        batches.forEach((batch, batchIndex) => {
+            const ordered = Array.from(batch.spines).sort((left, right) => left - right);
+            const first = ordered[0];
+            const last = ordered[ordered.length - 1];
+            // Preserve intervening time even if a future plan omits a zero-length segment.
+            batch.spines = [];
+            for (let spine = first; spine <= last; spine++) {
+                const duration = Number(parts[spine] && parts[spine].duration);
+                if (!Number.isFinite(duration) || duration <= 0 || !urls[spine]) {
+                    throw new Error(`Audio part ${spine + 1} has no valid duration or URL.`);
+                }
+                batch.spines.push(spine);
+                lastBatchUse.set(spine, batchIndex);
+            }
+            batch.baseTime = offsets[first];
+        });
+
+        try {
+            for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+                checkCancelled();
+                const batch = batches[batchIndex];
+                let removeAbortListener = () => {};
+                ffmpegLastLog = [];
+                try {
+                    // initFFmpeg's factory exposes its worker only after initialization.
+                    // Check cancellation immediately after it resolves, before using it.
+                    await initFFmpeg();
+                    checkCancelled();
+                    const instance = ffmpeg;
+                    let rejectCancellation;
+                    const cancellation = new Promise((resolve, reject) => { rejectCancellation = reject; });
+                    // The iterator can be suspended at yield when cancellation arrives.
+                    cancellation.catch(() => {});
+                    const onAbort = () => {
+                        rejectCancellation(abortError());
+                        resetFFmpeg();
+                    };
+                    if (signal) {
+                        signal.addEventListener('abort', onAbort, { once: true });
+                        removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+                    }
+                    checkCancelled();
+
+                    async function stage(action, label, timeoutMs = 120000) {
+                        checkCancelled();
+                        // Race inside runFFmpegStep, so abort clears that helper's timer
+                        // and worker listeners rather than leaving a pending wrapper.
+                        const result = await runFFmpegStep(
+                            () => Promise.race([Promise.resolve().then(action), cancellation]),
+                            label, timeoutMs, instance
+                        );
+                        checkCancelled();
+                        return result;
+                    }
+                    async function writeBlob(filename, blob) {
+                        const blobUrl = URL.createObjectURL(blob);
+                        try {
+                            await stage(() => instance.writeFileFromUrl(filename, blobUrl), `Loading ${filename}`);
+                        } finally {
+                            URL.revokeObjectURL(blobUrl);
+                        }
+                    }
+
+                    appendExportMessage(`Splitting chapter batch ${batchIndex + 1} of ${batches.length}...`);
+                    const concatLines = ['ffconcat version 1.0'];
+                    for (const spine of batch.spines) {
+                        checkCancelled();
+                        let blob = inputCache.get(spine);
+                        if (!blob) {
+                            appendExportMessage(`Downloading audio part ${spine + 1} of ${urls.length}...`);
+                            blob = await fetchMp3ExportBlob(urls[spine].url, `MP3 part ${spine + 1}`, 120000, signal);
+                            checkCancelled();
+                            if (/^(text\/|application\/(json|xml|xhtml\+xml))/i.test(blob.type)) {
+                                throw new Error(`MP3 part ${spine + 1}: the server returned ${blob.type} instead of audio.`);
+                            }
+                            inputCache.set(spine, blob);
+                        }
+                        const filename = `source-${spine + 1}.mp3`;
+                        await writeBlob(filename, blob);
+                        concatLines.push(`file '${filename}'`, `duration ${Number(parts[spine].duration).toFixed(6)}`);
+                    }
+                    await writeBlob('chapters.ffconcat', new Blob([concatLines.join('\n') + '\n']));
+
+                    const args = ['-y', '-abort_on', 'empty_output_stream', '-f', 'concat', '-safe', '0', '-i', 'chapters.ffconcat'];
+                    const outputs = [];
+                    batch.chapters.forEach((chapter, index) => {
+                        const start = chapter.start - batch.baseTime;
+                        const duration = chapter.end - chapter.start;
+                        if (!Number.isFinite(start) || start < -0.000001 || !Number.isFinite(duration) || duration <= 0) {
+                            throw new Error(`Chapter ${chapter.number} has invalid start/end times.`);
+                        }
+                        const filename = `chapter-${index + 1}.mp3`;
+                        outputs.push({ chapter, filename });
+                        // Output-side -ss/-t apply separately to every output. All chapters
+                        // share one sequential input scan; audio packets are copied intact.
+                        args.push(
+                            '-ss', Math.max(0, start).toFixed(6), '-t', duration.toFixed(6),
+                            '-map', '0:a:0', '-c:a', 'copy', '-map_metadata', '-1', '-map_chapters', '-1',
+                            '-metadata', `title=${chapter.title || 'Chapter ' + chapter.number}`,
+                            '-metadata', `album=${metadata.title || 'Audiobook'}`,
+                            '-metadata', `artist=${getAuthorString()}`,
+                            '-metadata', `track=${chapter.number}/${chapters.length}`,
+                            '-metadata', 'encoded_by=LibreGRAB',
+                            '-id3v2_version', '3', '-f', 'mp3', filename
+                        );
+                    });
+
+                    let lastProgressUpdate = 0;
+                    instance.setProgress(progress => {
+                        const now = Date.now();
+                        const seconds = Number(progress && progress.time) / 1000000;
+                        if (Number.isFinite(seconds) && seconds >= 0 && now - lastProgressUpdate >= 5000) {
+                            lastProgressUpdate = now;
+                            appendExportMessage(`Splitting batch ${batchIndex + 1}: ${(seconds / 60).toFixed(1)} audio minutes processed.`);
+                        }
+                    });
+                    const exitCode = await stage(() => instance.exec(args), 'Splitting MP3 chapters', 600000);
+                    if (typeof exitCode === 'number' && exitCode !== 0) {
+                        throw new Error(`FFmpeg could not split the chapters (exit code ${exitCode}).`);
+                    }
+
+                    for (const output of outputs) {
+                        checkCancelled();
+                        let workerUrl;
+                        let file;
+                        try {
+                            workerUrl = await stage(() => instance.readFileToUrl(output.filename), `Reading chapter ${output.chapter.number}`);
+                            if (typeof workerUrl !== 'string' || !workerUrl.startsWith('blob:')) {
+                                throw new Error(`Chapter ${output.chapter.number} has no valid output URL.`);
+                            }
+                            const blob = await fetchMp3ExportBlob(workerUrl, `Reading chapter ${output.chapter.number}`, 120000, signal);
+                            checkCancelled();
+                            // This page-owned File survives disposal of the FFmpeg worker.
+                            file = new File([blob], output.chapter.filename, { type: 'audio/mpeg' });
+                        } finally {
+                            if (workerUrl) URL.revokeObjectURL(workerUrl);
+                        }
+                        appendExportMessage(`Chapter ${output.chapter.number} of ${chapters.length} ready: ${output.chapter.title}`);
+                        yield { name: output.chapter.filename, input: file };
+                        checkCancelled();
+                    }
+                } catch (error) {
+                    if (signal && signal.aborted) throw abortError();
+                    const logs = ffmpegLastLog.slice(-12).join('\n');
+                    console.error('LibreGRAB: chapter export failed', error, ffmpegLastLog);
+                    throw new Error(`${error && error.message ? error.message : String(error)}${logs ? '\nFFmpeg log:\n' + logs : ''}`);
+                } finally {
+                    removeAbortListener();
+                    resetFFmpeg();
+                    // Keep a boundary source only while a later batch still needs it.
+                    for (const spine of inputCache.keys()) {
+                        if (lastBatchUse.get(spine) <= batchIndex) inputCache.delete(spine);
+                    }
+                }
+            }
+        } finally {
+            inputCache.clear();
+        }
+    }
+
+async function saveChapterZip({ createEntries, expectedNames, saveHandle, outputFilename, successMessage }) {
+    if (typeof createEntries !== 'function' || !Array.isArray(expectedNames) || !expectedNames.length) {
+        throw new Error('Invalid ZIP export plan.');
+    }
+    const names = expectedNames.slice();
+    if (names.some(name => typeof name !== 'string' || !name) || new Set(names).size !== names.length) {
+        throw new Error('The ZIP export plan contains empty or duplicate filenames.');
+    }
+
+    const controller = new AbortController();
+    let iterator = null;
+    let writable = null;
+    let writableClosed = false;
+    let cleanupPromise = null;
+    let cleanupError = null;
+    let failure = null;
+    let resultBlob = null;
+
+    function normalizeError(error) {
+        return error && typeof error.message === 'string' ? error : new Error(String(error));
+    }
+    function closeIterator() {
+        if (!cleanupPromise) {
+            cleanupPromise = Promise.resolve().then(async () => {
+                if (iterator && typeof iterator.return === 'function') await iterator.return();
+            }).then(
+                () => ({ done: true, value: undefined }),
+                error => {
+                    cleanupError = normalizeError(error);
+                    return { done: true, value: undefined };
+                }
+            );
+        }
+        // client-zip 2.5.0 invokes iterator.throw() without awaiting its Promise.
+        // This Promise must always resolve; cleanup failures are rethrown below.
+        return cleanupPromise;
+    }
+
+    try {
+        const writer = await getDownloadZip();
+        // Opening the ZIP stream can immediately pull its first input. Acquire
+        // the writable before constructing any iterator that cuts audio.
+        if (saveHandle) writable = await saveHandle.createWritable();
+        iterator = createEntries(controller.signal);
+        if (!iterator || typeof iterator.next !== 'function') {
+            throw new Error('The ZIP entry generator did not return a valid iterator.');
+        }
+
+        let count = 0;
+        const checkedEntries = {
+            [Symbol.asyncIterator]() { return this; },
+            async next() {
+                if (controller.signal.aborted) throw controller.signal.reason || new Error('ZIP export aborted.');
+                const item = await iterator.next();
+                if (controller.signal.aborted) throw controller.signal.reason || new Error('ZIP export aborted.');
+                if (!item || typeof item !== 'object') throw new Error('The ZIP entry generator returned an invalid result.');
+                if (item.done) {
+                    if (count !== names.length) {
+                        throw new Error(`Incomplete ZIP: expected ${names.length} entries, got ${count}.`);
+                    }
+                    return { done: true, value: undefined };
+                }
+                const actualName = item.value && item.value.name;
+                if (count >= names.length || actualName !== names[count]) {
+                    throw new Error(`ZIP entry order or filename mismatch: expected ${names[count] || 'no more files'}, got ${actualName}`);
+                }
+                count += 1;
+                return { done: false, value: item.value };
+            },
+            throw(error) {
+                controller.abort(error);
+                return closeIterator();
+            },
+            return() {
+                controller.abort(new Error('ZIP export aborted.'));
+                return closeIterator();
+            },
+        };
+
+        const zipResponse = writer(checkedEntries);
+        if (saveHandle) {
+            if (!zipResponse.body) throw new Error('The ZIP generator did not return a data stream.');
+            await zipResponse.body.pipeTo(writable);
+            writableClosed = true;
+            await verifyZipFileNames(await saveHandle.getFile(), names);
+        } else {
+            resultBlob = await zipResponse.blob();
+            await verifyZipFileNames(resultBlob, names);
+        }
+    } catch (error) {
+        failure = normalizeError(error);
+    } finally {
+        controller.abort(failure || new Error('ZIP export processing finished.'));
+        if (writable && !writableClosed) {
+            try { await writable.abort(failure); } catch (_) { /* pipeTo may already have aborted it. */ }
+        }
+        await closeIterator();
+    }
+
+    // A consumed generator cannot be replayed. Propagate failures and let a new
+    // user export start a fresh factory; never turn a partial book into a ZIP.
+    if (failure) throw failure;
+    if (cleanupError) throw cleanupError;
+    if (!saveHandle) await saveExportBlob(resultBlob, outputFilename, null);
+    if (successMessage) appendExportMessage(successMessage);
+}
+
+    async function exportChapterAudio() {
+        if (downloadState !== -1) return;
+        downloadState = 0;
+        let stage = 'Read chapter list';
+        try {
+            startExport('Split audio using metadata.chapters');
+            const metadata = getMetadata();
+            const plan = buildChapterPlan(metadata);
+            for (const chapter of plan.chapters) {
+                chapter.filename = getChapterFilename(chapter, plan.chapters.length, metadata.title);
+            }
+            appendExportMessage(`${metadata.spine.length} source audio files, ${metadata.chapters.length} chapter markers -> ${plan.chapters.length} chapter files.`);
+            appendExportMessage('Same-title continuations across source files are joined into one chapter. MP3 audio is copied without re-encoding; cuts align to audio frames.');
+            stage = 'Choose save location';
+            const filename = getSafeBookTitle(220) + ' - Chapters.zip';
+            const handle = await chooseExportHandle(filename, 'zip');
+            stage = 'Prepare audio';
+            const urls = orderChapterSourceUrls(await ensurePlayerUrls(getUrls()), metadata);
+            const bad = urls.filter(url => !hasWorkingUrl(url));
+            if (bad.length) throw new Error('Some source audio URLs are not available yet. Play the corresponding audio first, then try again.');
+            const extras = await createMetadata(metadata);
+            extras.push({
+                name: 'metadata/split-plan.json',
+                input: JSON.stringify({
+                    version: EXPORT_VERSION,
+                    sourceMetadata: 'metadata/metadata.json',
+                    timeUnit: 'seconds',
+                    audioMode: 'MP3 stream copy; cuts are aligned to audio frames',
+                    sourceFiles: metadata.spine.length,
+                    ...plan,
+                }, null, 2),
+            });
+            extras.push({
+                name: 'LibreGRAB-chapters.txt',
+                input: `LibreGRAB ${EXPORT_VERSION}\n${plan.chapters.map(chapter => chapter.filename).join('\n')}\n`,
+            });
+            const expectedNames = [...plan.chapters.map(chapter => chapter.filename), ...extras.map(file => file.name)];
+            stage = 'Split and archive chapters';
+            await saveChapterZip({
+                createEntries: async function* (signal) {
+                    yield* createChapterAudioEntries(urls, metadata, plan, signal);
+                    for (const file of extras) {
+                        if (signal.aborted) throw new Error('Chapter export stopped.');
+                        yield file;
+                    }
+                },
+                expectedNames,
+                saveHandle: handle,
+                outputFilename: filename,
+                successMessage: `Verified all ${plan.chapters.length} chapter files.`,
+            });
+        } catch (error) {
+            console.error('[LibreGRAB ' + EXPORT_VERSION + '] Chapter export failed', error);
+            appendExportMessage(error.name === 'AbortError' && stage === 'Choose save location'
+                ? 'Save cancelled.' : stage + ' failed: ' + error.message);
+        } finally {
+            resetFFmpeg();
             downloadState = -1;
         }
     }
@@ -998,7 +1536,7 @@
         }
 
         buildPirateUi();
-        // FFmpeg is loaded only when merging, so ZIP export never depends on it.
+        // Load FFmpeg only when merging or cutting chapters; original-part ZIPs skip it.
     }
 
 
