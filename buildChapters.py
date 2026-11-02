@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from dataclasses import dataclass
 from datetime import timedelta
 import json
@@ -64,7 +66,7 @@ class Metadata:
             creator["role"]: creator["name"]
             for creator in metadata["creator"]
         }
-        
+
         author = contributors.get("author")
         narrator = contributors.get("narrator")
 
@@ -77,7 +79,6 @@ class Metadata:
                 author = both
             if not narrator:
                 narrator = both
-
 
         return Metadata(
             title=metadata["title"],
@@ -121,9 +122,12 @@ def metadata_to_ffmpeg(metadata: Metadata) -> str:
         return int(
             chapter.total_offset.total_seconds() * 1000
         )
-    title_line = f"title={escape_for_ffmetadata(metadata.title)}\n"
-    author_line = (
-        f"artist={escape_for_ffmetadata(metadata.author)}\n"
+    esc_title = escape_for_ffmetadata(metadata.title)
+    title_line = f"title={esc_title}"
+    # Some apps (e.g., Bound) display the 'album' tag as the book's title.
+    album_line = f"album={esc_title}"
+    artist_line = (
+        f"artist={escape_for_ffmetadata(metadata.author)}"
         if metadata.author else ""
     )
     chapters_part = "\n".join(
@@ -140,7 +144,16 @@ def metadata_to_ffmpeg(metadata: Metadata) -> str:
            metadata.chapters[1:] + [Chapter("END", metadata.total_duration)]
         )
     )
-    return f";FFMETADATA1\n{title_line}{author_line}\n{chapters_part}"
+    return "\n".join(
+        (
+            ";FFMETADATA1",
+            title_line,
+            album_line,
+            artist_line,
+            "",
+            chapters_part
+        )
+    )
 
 
 if __name__ == "__main__":
