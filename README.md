@@ -1,13 +1,19 @@
+> [!CAUTION]
+> Overdrive/Libby has begun to send out copyright notices (_according to one of our contributors_). They have yet to do so for this repo; but if they do I plan to comply. For those who wish to fight; make your mirrors now!
+
+
 # LibbyRip
 
 Rip all your favorite audiobooks from libby! 
 
 <sup> Powered by [FFmpeg.js](https://github.com/PsychedelicPalimpsest/FFmpeg-js) </sup>
 
+
 ![Exporting audiobook](imgs/export.png)
 ![Showing chapters](imgs/chapters.png)
 
 <sup>Be careful, I have had multiple library cards banned in the past from using this tool (See [#14](https://github.com/PsychedelicPalimpsest/LibbyRip/issues/14), [#12](https://github.com/PsychedelicPalimpsest/LibbyRip/issues/12), and [#8](https://github.com/PsychedelicPalimpsest/LibbyRip/issues/8) for more details) </sup>
+
 
 
 ## How to use
