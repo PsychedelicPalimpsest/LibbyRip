@@ -1,6 +1,5 @@
 > [!CAUTION]
-> Overdrive/Libby has begun to send out copyright notices (_according to one of our contributors_). They have yet to do so for this repo; but if they do I plan to comply. For those who wish to fight; make your mirrors now!
-
+> Overdrive/Libby has requested us to delete this repo. We plan to comply, for those who wish to fight make your mirrors now!
 
 # LibbyRip
 
